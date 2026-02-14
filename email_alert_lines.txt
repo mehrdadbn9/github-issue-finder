@@ -1,0 +1,5 @@
+							if err := finder.SendEmailAlert(issues); err != nil {
+								log.Printf("Error sending email alert: %v", err)
+							} else {
+							log.Printf("Successfully sent email alert for %d issues", len(issues))
+						}

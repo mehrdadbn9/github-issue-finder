@@ -4,7 +4,7 @@ A Telegram bot that finds and alerts you about good learning opportunities (issu
 
 ## Features
 
-- Monitors 200+ popular Go DevOps projects (Kubernetes, Monitoring, CI/CD, CNCF tools)
+- Monitors 500+ popular Go DevOps projects
 - Scores issues based on multiple factors:
   - Project star count
   - Issue recency
@@ -15,28 +15,123 @@ A Telegram bot that finds and alerts you about good learning opportunities (issu
 - Persistent storage to track already notified issues
 - Configurable check intervals
 
-## Supported Projects
+## Supported Projects & Categories
 
-### Kubernetes Tools
+### 🔧 Kubernetes Tools (100+ projects)
 - kubernetes/kubernetes (105k★)
 - helm/helm (25k★)
 - cilium/cilium (18k★)
-- k9s (24k★)
-- trivy (21k★)
+- rancher/rancher (22k★)
+- rke, rke2, k3s, k0s
+- kind, kubespray, kubeadm
+- knative/serving, knative/eventing
+- kubeless, openfaas
 - And 100+ more...
 
-### Monitoring Tools
+### 📈 Monitoring Tools (100+ projects)
 - prometheus/prometheus (53k★)
 - grafana/grafana (58k★)
 - jaegertracing/jaeger (19k★)
 - thanos-io/thanos (12k★)
-- And 50+ more...
+- VictoriaMetrics (10k★)
+- cortex, mimir, tempo, loki
+- kubeshark, telegraf
+- And 100+ more...
 
-### CI/CD Tools
+### 🚀 CI/CD Tools (80+ projects)
 - argoproj/argo-cd (15k★)
 - drone/drone (28k★)
 - tektoncd/pipeline (8k★)
+- fluxcd/flux2 (6k★)
+- skaffold, tilt, jib, kaniko
+- watchtower, buildpacks, ko
+- spinnaker, prow
+- And 80+ more...
+
+### 🔐 Security Tools (30+ projects)
+- aquasecurity/trivy (21k★)
+- kyverno/kyverno (5k★)
+- falcosecurity/falco (5k★)
+- open-policy-agent/gatekeeper
+- stackrox, deepfence, neuvector
+- cert-manager, external-secrets-operator
+- And 30+ more...
+
+### 🗃️ Database Tools (50+ projects)
+- influxdata/influxdb (28k★)
+- cockroachdb/cockroach (30k★)
+- etcd-io/etcd (46k★)
+- tidwall/gjson, dgraph-io/dgraph
+- ClickHouse, badger, boltdb
 - And 50+ more...
+
+### 🏗️ Infrastructure as Code (20+ projects)
+- hashicorp/terraform (42k★)
+- pulumi/pulumi (19k★)
+- hashicorp/packer (15k★)
+- crossplane, vmware-tanzu/carvel
+- tflint, tfsec, infracost
+- And 20+ more...
+
+### 🤖 Service Mesh & Gateway (40+ projects)
+- envoyproxy/envoy (24k★)
+- istio/istio (35k★)
+- Kong/kong (37k★)
+- cilium/cilium (18k★)
+- kuma, linkerd, traefik
+- kubernetes-sigs/gateway-api
+- And 40+ more...
+
+### 📨 Messaging & Queues (30+ projects)
+- apache/kafka (28k★)
+- apache/pulsar (5k★)
+- nats-io/nats-server (15k★)
+- redpanda-data/redpanda (7.5k★)
+- nsqio/nsq (24k★)
+- emqx/emqx, mosquitto
+- confluent-kafka-go, sarama
+- And 30+ more...
+
+### 🔄 Automation (10+ projects)
+- ansible/ansible (61k★)
+- ansible/awx, ansible-runner
+- ansible-collections
+- And 10+ more...
+
+### 🏢 Platform (10+ projects)
+- rancher/rancher (22k★)
+- rancher/rke, rancher/rke2
+- And 10+ more...
+
+### 📦 Backup & Storage (10+ projects)
+- restic/restic (24k★)
+- kopia/kopia (5k★)
+- vmware-tanzu/velero (8k★)
+- minio/minio (45k★)
+- And 10+ more...
+
+### 🐋 Container & Registry (20+ projects)
+- containers/buildah (7k★)
+- containers/podman (20k★)
+- goharbor/harbor (22k★)
+- docker/buildkit (9k★)
+- docker/compose (33k★)
+- And 20+ more...
+
+### 🌐 API & Web Frameworks (40+ projects)
+- gin-gonic/gin (77k★)
+- golang/net (50k★)
+- go-swagger/go-swagger (12k★)
+- gorilla/mux, gorilla/websocket
+- labstack/echo, go-chi/chi
+- grpc-go, grpc-gateway
+- micro/go-micro
+- And 40+ more...
+
+### 🧪 Testing (10+ projects)
+- stretchr/testify (21k★)
+- golang/mock, uber-go/mock
+- And 10+ more...
 
 ## Setup
 
@@ -84,6 +179,8 @@ go run main.go
 - `DB_CONNECTION_STRING`: PostgreSQL connection string (default: localhost postgres/postgres)
 - `CHECK_INTERVAL`: Check interval in seconds (default: 3600)
 - `MAX_ISSUES_PER_REPO`: Max issues to fetch per repo (default: 10)
+- `LOG_DIR`: Directory for notifier logs (default: `./logs`)
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `FROM_EMAIL`, `TO_EMAIL`: Optional email settings for SMTP delivery (enable email alerts when all are set)
 
 ### Getting Telegram Bot Token
 
@@ -179,6 +276,12 @@ f.projects = append(f.projects, Project{
     Stars:    5000,
 })
 ```
+
+## Issue Assignment Safety
+
+- Automated scripts that previously reassigned issues have been disabled.
+- Review `docs/ISSUE_ASSIGNMENT.md` for the updated, approval-based workflow.
+- Ensure any new automation uses scoped tokens and requires human confirmation before assigning issues.
 
 ## Contributing
 

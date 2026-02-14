@@ -1,0 +1,21 @@
+[
+    "",
+    {"\nnew_code =": "t"},
+    {
+        "n\t\tSMTPHost": "config.SMTPHost",
+        "n\t\tSMTPPort": "config.SMTPPort",
+        "n\t\tSMTPUsername": "config.SMTPUsername",
+        "n\t\tSMTPPassword": "config.SMTPPassword",
+        "n\t\tFromEmail": "config.FromEmail",
+        "n\t\tToEmail": "config.ToEmail",
+        "n\t}\n\n\tfinder": "IssueFinder{'\n\ncontent = content.replace(old_code",
+        "\\t\tconfig:        config,\n\t\tclient:        github.NewClient(tc),\n\t\tbot:           bot,\n\t\tdb:            db,'\nnew_finder =": "t\tconfig:        config",
+        "n\t\tclient": "github.NewClient(tc)",
+        "n\t\tbot": "bot",
+        "n\t\temailNotifier": "NewEmailNotifier(emailConfig)",
+        "n\t\tdb": "db",
+        "\n\ncontent = content.replace(old_finder, new_finder)\n\n# Add SendEmailAlert method after SendTelegramAlert\nold_alert =": "treturn nil",
+    },
+    [],
+    {"alert": "n\t\treturn nil"},
+]

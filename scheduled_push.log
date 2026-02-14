@@ -1,0 +1,79 @@
+[2026-02-15 00:02:01] Starting scheduled push...
+On branch master
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+	modified:   .env.example
+	modified:   .gitignore
+	modified:   Dockerfile
+	modified:   README.md
+	modified:   go.mod
+	modified:   main.go
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	Makefile
+	QUICKSTART.md
+	add_all.py
+	add_email.py
+	add_email_alert.py
+	add_email_config.py
+	apply_fixes.py
+	assign_best_issues.py
+	assign_issues.sh
+	check_issues.sh
+	comment_manager.go
+	comment_quality.go
+	comment_quality_test.go
+	complete_email_setup.py
+	config.go
+	contribution_policy.go
+	debug_script.py
+	docker-compose.yml
+	docs/
+	email_alert_lines.txt
+	filter_and_assign.py
+	filter_issues.py
+	fix_all.py
+	fix_email.py
+	fix_main.py
+	fix_telegram_v2.py
+	go.sum
+	healthcheck.sh
+	insert_email.py
+	insert_email_alert.py
+	issue_analyzer.go
+	issue_analyzer_test.go
+	issues.log
+	k9s/
+	local_notifier.go
+	logger.go
+	main_test.go
+	notification_bridge.sh
+	patch.py
+	patch_main.py
+	review-tools/
+	run.sh
+	scheduled_push.log
+	scripts/
+	setup.sh
+	show_good_first_issues.sh
+	show_results.sh
+	test.sh
+
+no changes added to commit (use "git add" and/or "git commit -a")
+[2026-02-15 00:02:01] Staging changes...
+warning: adding embedded git repository: k9s
+hint: You've added another git repository inside your current repository.
+hint: Clones of the outer repository will not contain the contents of
+hint: the embedded repository and will not know how to obtain it.
+hint: If you meant to add a submodule, use:
+hint: 
+hint: 	git submodule add <url> k9s
+hint: 
+hint: If you added this path by mistake, you can remove it from the
+hint: index with:
+hint: 
+hint: 	git rm --cached k9s
+hint: 
+hint: See "git help submodule" for more information.

@@ -7,7 +7,9 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -16,17 +18,9 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/google/go-github/v58/github"
 	"github.com/jmoiron/sqlx"
+	_ "github.com/lib/pq"
 	"golang.org/x/oauth2"
 )
-
-type Config struct {
-	GitHubToken        string `json:"github_token"`
-	TelegramBotToken   string `json:"telegram_bot_token"`
-	TelegramChatID     int64  `json:"telegram_chat_id"`
-	CheckInterval      int    `json:"check_interval"`
-	MaxIssuesPerRepo   int    `json:"max_issues_per_repo"`
-	DBConnectionString string `json:"db_connection_string"`
-}
 
 type Project struct {
 	Org      string
@@ -52,14 +46,155 @@ type IssueScorer struct {
 	weights map[string]float64
 }
 
+type RateLimitStatus struct {
+	Limit     int
+	Remaining int
+	Reset     time.Time
+}
+
+type RateLimiter struct {
+	mu           sync.Mutex
+	status       RateLimitStatus
+	client       *github.Client
+	minRemaining int
+}
+
+func NewRateLimiter(client *github.Client, minRemaining int) *RateLimiter {
+	return &RateLimiter{
+		client:       client,
+		minRemaining: minRemaining,
+		status: RateLimitStatus{
+			Limit:     5000,
+			Remaining: 5000,
+			Reset:     time.Now().Add(time.Hour),
+		},
+	}
+}
+
+func (r *RateLimiter) updateStatusFromResponse(resp *github.Response) {
+	if resp == nil {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if limit := resp.Rate.Limit; limit != 0 {
+		r.status.Limit = limit
+	}
+	if remaining := resp.Rate.Remaining; remaining != 0 {
+		r.status.Remaining = remaining
+	}
+	if !resp.Rate.Reset.IsZero() {
+		r.status.Reset = resp.Rate.Reset.Time
+	}
+
+	log.Printf("[Rate Limit] %d/%d remaining, reset at %v",
+		r.status.Remaining, r.status.Limit, r.status.Reset.Format("15:04:05"))
+}
+
+func (r *RateLimiter) WaitIfNeeded(ctx context.Context) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.status.Remaining < r.minRemaining {
+		waitDuration := time.Until(r.status.Reset)
+		if waitDuration < 0 {
+			waitDuration = time.Minute
+		}
+
+		log.Printf("[Rate Limit] Near limit (%d/%d remaining), waiting %v until reset at %v",
+			r.status.Remaining, r.status.Limit, waitDuration.Round(time.Second), r.status.Reset.Format("15:04:05"))
+
+		r.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			r.mu.Lock()
+			return ctx.Err()
+		case <-time.After(waitDuration):
+			r.mu.Lock()
+		}
+
+		r.status.Remaining = r.status.Limit
+	}
+
+	return nil
+}
+
+func (r *RateLimiter) checkRateLimit(ctx context.Context) error {
+	rateLimit, _, err := r.client.RateLimits(ctx)
+	if err != nil {
+		log.Printf("[Rate Limit] Failed to fetch rate limits: %v", err)
+		return err
+	}
+
+	if core := rateLimit.Core; core != nil {
+		r.mu.Lock()
+		r.status.Limit = core.Limit
+		r.status.Remaining = core.Remaining
+		if !core.Reset.IsZero() {
+			r.status.Reset = core.Reset.Time
+		}
+		r.mu.Unlock()
+
+		log.Printf("[Rate Limit] Current status: %d/%d remaining, reset at %v",
+			r.status.Remaining, r.status.Limit, r.status.Reset.Format("15:04:05"))
+	}
+
+	return nil
+}
+
+func (r *RateLimiter) executeWithRetry(ctx context.Context, operation string, fn func() (*github.Response, error)) error {
+	maxRetries := 5
+	backoff := time.Second
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		if err := r.WaitIfNeeded(ctx); err != nil {
+			return err
+		}
+
+		resp, err := fn()
+		if err != nil {
+			if resp != nil {
+				r.updateStatusFromResponse(resp)
+			}
+
+			if strings.Contains(err.Error(), "403") || strings.Contains(err.Error(), "rate limit") {
+				if attempt < maxRetries {
+					waitTime := backoff * time.Duration(1<<(attempt-1))
+					log.Printf("[Rate Limit] Hit rate limit on attempt %d/%d for %s, retrying in %v",
+						attempt, maxRetries, operation, waitTime.Round(time.Second))
+
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(waitTime):
+						continue
+					}
+				}
+			}
+
+			return fmt.Errorf("failed after %d attempts: %w", attempt, err)
+		}
+
+		if resp != nil {
+			r.updateStatusFromResponse(resp)
+		}
+
+		return nil
+	}
+
+	return fmt.Errorf("max retries exceeded for %s", operation)
+}
+
 func NewIssueScorer() *IssueScorer {
 	return &IssueScorer{
 		weights: map[string]float64{
-			"stars_factor":      0.15,
-			"comments_factor":   0.20,
-			"recency_factor":    0.20,
+			"stars_factor":      0.10,
+			"comments_factor":   0.25,
+			"recency_factor":    0.25,
 			"labels_factor":     0.25,
-			"difficulty_factor": 0.20,
+			"difficulty_factor": 0.15,
 		},
 	}
 }
@@ -79,10 +214,151 @@ func (s *IssueScorer) ScoreIssue(issue *github.Issue, project Project) float64 {
 	labelsScore := s.normalizeLabels(issue.Labels)
 	score += labelsScore * s.weights["labels_factor"]
 
-	difficultyScore := s.normalizeDifficulty(issue.Labels, *issue.Body)
+	difficultyScore := s.normalizeDifficulty(issue.Labels, safeString(issue.Body))
 	score += difficultyScore * s.weights["difficulty_factor"]
 
+	title := strings.ToLower(safeString(issue.Title))
+	body := strings.ToLower(safeString(issue.Body))
+	combined := title + " " + body
+
+	// Go 1.26 related issues - high priority
+	if strings.Contains(combined, "go 1.26") || strings.Contains(combined, "go1.26") || strings.Contains(combined, "golang 1.26") {
+		score += 0.30
+	}
+	if strings.Contains(combined, "upgrade") && (strings.Contains(combined, "go ") || strings.Contains(combined, "golang")) {
+		score += 0.15
+	}
+
+	// Good labels
+	if strings.Contains(combined, "good first issue") || hasLabel(issue.Labels, "good first issue") {
+		score += 0.20
+	}
+	if strings.Contains(combined, "help wanted") || hasLabel(issue.Labels, "help wanted") {
+		score += 0.15
+	}
+
+	// TLS/Security - user preference
+	if strings.Contains(strings.ToLower(project.Category), "tls") || strings.Contains(strings.ToLower(project.Category), "security") {
+		score += 0.10
+	}
+	if strings.Contains(combined, "tls") || strings.Contains(combined, "ssl") || strings.Contains(combined, "certificate") || strings.Contains(combined, "https") {
+		score += 0.10
+	}
+
+	// CNCF projects bonus
+	cncfProjects := []string{"kubernetes", "prometheus", "etcd", "istio", "cilium", "containerd", "grpc", "helm", "dapr", "keda", "argo", "rancher", "velero", "traefik"}
+	if slices.ContainsFunc(cncfProjects, func(p string) bool {
+		return strings.Contains(strings.ToLower(project.Name), p)
+	}) {
+		score += 0.10
+	}
+
+	// Documentation-only issues - easier to contribute
+	if strings.Contains(combined, "documentation") || strings.Contains(combined, "docs") ||
+		strings.Contains(title, "doc:") || hasLabel(issue.Labels, "documentation") {
+		score += 0.15
+	}
+
+	// Clear scope indicators - issue mentions specific files/functions
+	clearScopeKeywords := []string{"file:", "func:", "in ", "method", "struct", "interface", "package"}
+	clearCount := 0
+	for _, kw := range clearScopeKeywords {
+		if strings.Contains(combined, kw) {
+			clearCount++
+		}
+	}
+	if clearCount >= 2 {
+		score += 0.10
+	}
+
+	// Clear reproduction steps - issues with code blocks or steps
+	if strings.Contains(body, "```") || strings.Contains(body, "steps to reproduce") ||
+		strings.Contains(body, "reproduc") {
+		score += 0.10
+	}
+
+	// Easy/quick fix indicators
+	easyKeywords := []string{"quick", "easy", "simple", "trivial", "small", "minor", "typo", "spelling"}
+	if containsAny(combined, easyKeywords) {
+		score += 0.05
+	}
+
+	// Stale but available - issues open for a while with no activity (1-6 months)
+	age := time.Since(issue.CreatedAt.Time).Hours()
+	if age > 720 && age < 4320 && *issue.Comments <= 3 {
+		score += 0.10
+	}
+
+	// Cloud provider penalty - user uses bare metal
+	cloudKeywords := []string{
+		"gcp", "google cloud", "compute engine", "gke", "cloud sql", "bigquery", "pubsub",
+		"aws", "amazon web", "ec2", "s3 bucket", "lambda", "eks", "rds", "dynamodb",
+		"azure", "microsoft azure", "aks", "azure functions", "azure storage",
+	}
+	if containsAny(combined, cloudKeywords) {
+		score -= 0.50
+	}
+
+	if hasAnyLabel(issue.Labels, "provider:google", "provider:aws", "provider:azure", "area/gcp", "area/aws", "area/azure") {
+		score -= 0.50
+	}
+
+	// Needs triage penalty - can't work on until triaged
+	if hasLabel(issue.Labels, "needs-triage") {
+		score -= 0.15
+	}
+
+	// Blocked/waiting penalty
+	blockedKeywords := []string{"blocked", "waiting for", "needs approval", "on hold", "pending"}
+	if containsAny(combined, blockedKeywords) {
+		score -= 0.20
+	}
+
+	// Wontfix/invalid penalty
+	if hasAnyLabel(issue.Labels, "wontfix", "invalid", "duplicate", "wont-fix") {
+		score -= 0.50
+	}
+
+	// Needs info penalty - incomplete issue
+	if hasAnyLabel(issue.Labels, "needs info", "needs-information", "waitingforinfo") {
+		score -= 0.15
+	}
+
+	// Clamp score
+	if score > 1.5 {
+		score = 1.5
+	}
+	if score < 0 {
+		score = 0
+	}
+
 	return score
+}
+
+func hasLabel(labels []*github.Label, target string) bool {
+	targetLower := strings.ToLower(target)
+	return slices.ContainsFunc(labels, func(label *github.Label) bool {
+		return strings.Contains(strings.ToLower(label.GetName()), targetLower)
+	})
+}
+
+func hasAnyLabel(labels []*github.Label, targets ...string) bool {
+	return slices.ContainsFunc(targets, func(target string) bool {
+		return hasLabel(labels, target)
+	})
+}
+
+func containsAny(text string, keywords []string) bool {
+	return slices.ContainsFunc(keywords, func(kw string) bool {
+		return strings.Contains(text, kw)
+	})
+}
+
+func safeString(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func (s *IssueScorer) normalizeStars(stars int) float64 {
@@ -187,26 +463,33 @@ func (s *IssueScorer) normalizeDifficulty(labels []*github.Label, body string) f
 }
 
 type IssueFinder struct {
-	config     *Config
-	client     *github.Client
-	bot        *tgbotapi.BotAPI
-	db         *sqlx.DB
-	scorer     *IssueScorer
-	projects   []Project
-	seenIssues map[string]bool
-	mu         sync.RWMutex
+	config      *Config
+	client      *github.Client
+	rateLimiter *RateLimiter
+	bot         *tgbotapi.BotAPI
+	notifier    *LocalNotifier
+	db          *sqlx.DB
+	scorer      *IssueScorer
+	projects    []Project
+	seenIssues  map[string]bool
+	mu          sync.RWMutex
 }
 
-func NewIssueFinder(config *Config) (*IssueFinder, error) {
+func NewIssueFinder(config *Config, notifier *LocalNotifier) (*IssueFinder, error) {
 	ctx := context.Background()
 	ts := oauth2.StaticTokenSource(
 		&oauth2.Token{AccessToken: config.GitHubToken},
 	)
 	tc := oauth2.NewClient(ctx, ts)
 
-	bot, err := tgbotapi.NewBotAPI(config.TelegramBotToken)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Telegram bot: %w", err)
+	var bot *tgbotapi.BotAPI
+	if config.TelegramBotToken != "" {
+		var err error
+		bot, err = tgbotapi.NewBotAPI(config.TelegramBotToken)
+		if err != nil {
+			log.Printf("Warning: failed to create Telegram bot (Telegram disabled): %v", err)
+			bot = nil
+		}
 	}
 
 	db, err := sqlx.Connect("postgres", config.DBConnectionString)
@@ -214,13 +497,23 @@ func NewIssueFinder(config *Config) (*IssueFinder, error) {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
 
+	client := github.NewClient(tc)
+	rateLimiter := NewRateLimiter(client, 100)
+
+	log.Printf("Initializing rate limiter with 100 request buffer...")
+	if err := rateLimiter.checkRateLimit(ctx); err != nil {
+		log.Printf("Warning: failed to fetch initial rate limits: %v", err)
+	}
+
 	finder := &IssueFinder{
-		config:     config,
-		client:     github.NewClient(tc),
-		bot:        bot,
-		db:         db,
-		scorer:     NewIssueScorer(),
-		seenIssues: make(map[string]bool),
+		config:      config,
+		client:      client,
+		rateLimiter: rateLimiter,
+		bot:         bot,
+		notifier:    notifier,
+		db:          db,
+		scorer:      NewIssueScorer(),
+		seenIssues:  make(map[string]bool),
 	}
 
 	if err := finder.initDB(); err != nil {
@@ -524,6 +817,156 @@ func (f *IssueFinder) initializeProjects() {
 		{Org: "mesonbuild", Name: "meson", Category: "CI/CD", Stars: 3000},
 		{Org: "ninja-build", Name: "ninja", Category: "CI/CD", Stars: 3000},
 		{Org: "rust-lang", Name: "cargo", Category: "CI/CD", Stars: 5000},
+
+		// ML/AI Projects
+		{Org: "tensorflow", Name: "tensorflow", Category: "ML/AI", Stars: 185000},
+		{Org: "pytorch", Name: "pytorch", Category: "ML/AI", Stars: 85000},
+		{Org: "huggingface", Name: "transformers", Category: "ML/AI", Stars: 140000},
+		{Org: "langchain-ai", Name: "langchain", Category: "ML/AI", Stars: 100000},
+		{Org: "openai", Name: "openai-python", Category: "ML/AI", Stars: 25000},
+		{Org: "scikit-learn", Name: "scikit-learn", Category: "ML/AI", Stars: 60000},
+		{Org: "keras-team", Name: "keras", Category: "ML/AI", Stars: 62000},
+		{Org: "onnx", Name: "onnx", Category: "ML/AI", Stars: 18000},
+		{Org: "microsoft", Name: "DeepSpeed", Category: "ML/AI", Stars: 35000},
+		{Org: "Lightning-AI", Name: "lightning", Category: "ML/AI", Stars: 28000},
+		{Org: "explosion", Name: "spaCy", Category: "ML/AI", Stars: 30000},
+		{Org: "stanfordnlp", Name: "CoreNLP", Category: "ML/AI", Stars: 9500},
+		{Org: "paddlepaddle", Name: "paddle", Category: "ML/AI", Stars: 22000},
+		{Org: "apache", Name: "mxnet", Category: "ML/AI", Stars: 21000},
+		{Org: "Theano", Name: "Theano", Category: "ML/AI", Stars: 10000},
+		{Org: "cupy", Name: "cupy", Category: "ML/AI", Stars: 8000},
+		{Org: "dmlc", Name: "xgboost", Category: "ML/AI", Stars: 26000},
+		{Org: "microsoft", Name: "LightGBM", Category: "ML/AI", Stars: 17000},
+		{Org: "dmlc", Name: "tvm", Category: "ML/AI", Stars: 11000},
+		{Org: "ray-project", Name: "ray", Category: "ML/AI", Stars: 35000},
+		{Org: "fastai", Name: "fastai", Category: "ML/AI", Stars: 26000},
+		{Org: "Stability-AI", Name: "stablediffusion", Category: "ML/AI", Stars: 40000},
+		{Org: "CompVis", Name: "stable-diffusion", Category: "ML/AI", Stars: 70000},
+		{Org: "AUTOMATIC1111", Name: "stable-diffusion-webui", Category: "ML/AI", Stars: 145000},
+		{Org: "mlflow", Name: "mlflow", Category: "ML/AI", Stars: 19000},
+		{Org: "wandb", Name: "wandb", Category: "ML/AI", Stars: 9000},
+		{Org: "apache", Name: "airflow", Category: "ML/AI", Stars: 38000},
+		{Org: "prefecthq", Name: "prefect", Category: "ML/AI", Stars: 16000},
+		{Org: "pinecone-io", Name: "pinecone-python-client", Category: "ML/AI", Stars: 3000},
+		{Org: "weaviate", Name: "weaviate", Category: "ML/AI", Stars: 12000},
+		{Org: "milvus-io", Name: "milvus", Category: "ML/AI", Stars: 31000},
+		{Org: "qdrant", Name: "qdrant", Category: "ML/AI", Stars: 21000},
+		{Org: "chroma-core", Name: "chroma", Category: "ML/AI", Stars: 15000},
+		{Org: "llama-index", Name: "llama_index", Category: "ML/AI", Stars: 38000},
+		{Org: "deepset-ai", Name: "haystack", Category: "ML/AI", Stars: 18000},
+		{Org: "obhava", Name: "obhava", Category: "ML/AI", Stars: 1000},
+		{Org: "vllm-project", Name: "vllm", Category: "ML/AI", Stars: 30000},
+		{Org: "ggerganov", Name: "llama.cpp", Category: "ML/AI", Stars: 70000},
+		{Org: "lm-sys", Name: "FastChat", Category: "ML/AI", Stars: 37000},
+		{Org: "oobabooga", Name: "text-generation-webui", Category: "ML/AI", Stars: 42000},
+		{Org: "microsoft", Name: "semantic-kernel", Category: "ML/AI", Stars: 22000},
+		{Org: "microsoft", Name: "autogen", Category: "ML/AI", Stars: 32000},
+		{Org: "langchain-ai", Name: "langgraph", Category: "ML/AI", Stars: 10000},
+		{Org: "run-llama", Name: "llama_index", Category: "ML/AI", Stars: 38000},
+		{Org: "unslothai", Name: "unsloth", Category: "ML/AI", Stars: 10000},
+		{Org: "axolotl-ai-cloud", Name: "axolotl", Category: "ML/AI", Stars: 8000},
+
+		// Additional Go Projects - CNCF, Security, Networking, TLS
+		{Org: "istio", Name: "istio", Category: "TLS/Security", Stars: 35000},
+		{Org: "traefik", Name: "traefik", Category: "TLS/Security", Stars: 50000},
+		{Org: "caddyserver", Name: "caddy", Category: "TLS/Security", Stars: 58000},
+		{Org: "grpc", Name: "grpc-go", Category: "TLS/Security", Stars: 21000},
+		{Org: "dapr", Name: "dapr", Category: "TLS/Security", Stars: 24000},
+		{Org: "kubernetes", Name: "ingress-nginx", Category: "TLS/Security", Stars: 17000},
+		{Org: "oauth2-proxy", Name: "oauth2-proxy", Category: "TLS/Security", Stars: 9000},
+		{Org: "cert-manager", Name: "cert-manager", Category: "TLS/Security", Stars: 12000},
+		{Org: "external-secrets", Name: "external-secrets", Category: "TLS/Security", Stars: 4000},
+		{Org: "secrets-store-csi-driver", Name: "secrets-store-csi-driver", Category: "TLS/Security", Stars: 1500},
+		{Org: "spiffe", Name: "spire", Category: "TLS/Security", Stars: 2000},
+		{Org: "open-policy-agent", Name: "gatekeeper", Category: "TLS/Security", Stars: 3500},
+		{Org: "cloudflare", Name: "cfssl", Category: "TLS/Security", Stars: 2000},
+		{Org: "smallstep", Name: "certificates", Category: "TLS/Security", Stars: 6000},
+		{Org: "jetstack", Name: "cert-manager", Category: "TLS/Security", Stars: 12000},
+		{Org: "hashicorp", Name: "boundary", Category: "TLS/Security", Stars: 5000},
+		{Org: "hashicorp", Name: "waypoint", Category: "TLS/Security", Stars: 5000},
+		{Org: "sosedoff", Name: "pgweb", Category: "TLS/Security", Stars: 9000},
+		{Org: "gorush", Name: "gorush", Category: "Go Tools", Stars: 8000},
+		{Org: "goreleaser", Name: "goreleaser", Category: "Go Tools", Stars: 14000},
+		{Org: "golangci", Name: "golangci-lint", Category: "Go Tools", Stars: 15000},
+		{Org: "stretchr", Name: "testify", Category: "Go Tools", Stars: 23000},
+		{Org: "uber-go", Name: "zap", Category: "Go Tools", Stars: 22000},
+		{Org: "uber-go", Name: "fx", Category: "Go Tools", Stars: 6000},
+		{Org: "uber-go", Name: "dig", Category: "Go Tools", Stars: 4000},
+		{Org: "spf13", Name: "cobra", Category: "Go Tools", Stars: 38000},
+		{Org: "spf13", Name: "viper", Category: "Go Tools", Stars: 27000},
+		{Org: "urfave", Name: "cli", Category: "Go Tools", Stars: 22000},
+		{Org: "joho", Name: "godotenv", Category: "Go Tools", Stars: 8000},
+		{Org: "go-playground", Name: "validator", Category: "Go Tools", Stars: 17000},
+		{Org: "swaggo", Name: "swag", Category: "Go Tools", Stars: 110000},
+		{Org: "golang-migrate", Name: "migrate", Category: "Go Tools", Stars: 150000},
+		{Org: "ent", Name: "ent", Category: "Go Tools", Stars: 15000},
+		{Org: "go-gorm", Name: "gorm", Category: "Go Tools", Stars: 37000},
+		{Org: "go-redis", Name: "redis", Category: "TLS/Security", Stars: 20000},
+		{Org: "minio", Name: "minio", Category: "TLS/Security", Stars: 45000},
+		{Org: "nutsdb", Name: "nutsdb", Category: "Go Tools", Stars: 3000},
+		{Org: "tidwall", Name: "gjson", Category: "Go Tools", Stars: 14000},
+		{Org: "tidwall", Name: "sjson", Category: "Go Tools", Stars: 2000},
+		{Org: "tidwall", Name: "buntdb", Category: "Go Tools", Stars: 4000},
+		{Org: "klauspost", Name: "compress", Category: "Go Tools", Stars: 5000},
+		{Org: "valyala", Name: "fasthttp", Category: "Go Web", Stars: 22000},
+		{Org: "panjf2000", Name: "ants", Category: "Go Tools", Stars: 13000},
+		{Org: "shirou", Name: "gopsutil", Category: "Go Tools", Stars: 11000},
+		{Org: "mitchellh", Name: "mapstructure", Category: "Go Tools", Stars: 8000},
+		{Org: "google", Name: "wire", Category: "Go Tools", Stars: 13000},
+		{Org: "google", Name: "go-cmp", Category: "Go Tools", Stars: 4000},
+		{Org: "pkg", Name: "errors", Category: "Go Tools", Stars: 9000},
+		{Org: "fsnotify", Name: "fsnotify", Category: "Go Tools", Stars: 10000},
+		{Org: "asaskevich", Name: "govalidator", Category: "Go Tools", Stars: 6000},
+		{Org: "go-ozzo", Name: "ozzo-validation", Category: "Go Tools", Stars: 4000},
+		{Org: "gofrs", Name: "uuid", Category: "Go Tools", Stars: 2000},
+		{Org: "google", Name: "uuid", Category: "Go Tools", Stars: 6000},
+		{Org: "rs", Name: "zerolog", Category: "Go Tools", Stars: 11000},
+		{Org: "sirupsen", Name: "logrus", Category: "Go Tools", Stars: 25000},
+		{Org: "opentracing", Name: "opentracing-go", Category: "TLS/Security", Stars: 4000},
+		{Org: "open-telemetry", Name: "opentelemetry-go", Category: "TLS/Security", Stars: 4500},
+		{Org: "open-telemetry", Name: "opentelemetry-collector", Category: "TLS/Security", Stars: 3500},
+		{Org: "cloudnative-pg", Name: "cloudnative-pg", Category: "Kubernetes", Stars: 5000},
+		{Org: "operator-framework", Name: "operator-sdk", Category: "Kubernetes", Stars: 7000},
+		{Org: "kubebuilder", Name: "kubebuilder", Category: "Kubernetes", Stars: 8000},
+		{Org: "controller-runtime", Name: "controller-runtime", Category: "Kubernetes", Stars: 3000},
+		{Org: "kubernetes-sigs", Name: "kind", Category: "Kubernetes", Stars: 14000},
+		{Org: "kubernetes-sigs", Name: "kustomize", Category: "Kubernetes", Stars: 11000},
+		{Org: "kubernetes-sigs", Name: "cluster-api", Category: "Kubernetes", Stars: 4000},
+		{Org: "kubernetes-sigs", Name: "kubebuilder", Category: "Kubernetes", Stars: 8000},
+		{Org: "gravitational", Name: "teleport", Category: "TLS/Security", Stars: 18000},
+		{Org: "rancher", Name: "rancher", Category: "Kubernetes", Stars: 23000},
+		{Org: "rancher", Name: "fleet", Category: "Kubernetes", Stars: 2000},
+		{Org: "gravitational", Name: "gravity", Category: "Kubernetes", Stars: 3000},
+		{Org: "ovh", Name: "vrack", Category: "Networking", Stars: 500},
+		{Org: "tailscale", Name: "tailscale", Category: "TLS/Security", Stars: 20000},
+		{Org: "netbirdio", Name: "netbird", Category: "TLS/Security", Stars: 12000},
+		{Org: "firezone", Name: "firezone", Category: "TLS/Security", Stars: 7000},
+		{Org: "wireguard", Name: "wireguard-go", Category: "TLS/Security", Stars: 3000},
+		{Org: "junegunn", Name: "fzf", Category: "Go Tools", Stars: 67000},
+		{Org: "junegunn", Name: "go-runewidth", Category: "Go Tools", Stars: 400},
+		{Org: "lotusirous", Name: "go-concurrency", Category: "Go Tools", Stars: 3000},
+		{Org: "uber-go", Name: "guide", Category: "Go Tools", Stars: 16000},
+		{Org: "golang-design", Name: "go2generics", Category: "Go Tools", Stars: 2000},
+		{Org: "golang", Name: "go", Category: "Go Core", Stars: 125000},
+		{Org: "golang", Name: "crypto", Category: "TLS/Security", Stars: 3000},
+		{Org: "golang", Name: "net", Category: "TLS/Security", Stars: 3000},
+		{Org: "golang", Name: "sys", Category: "Go Core", Stars: 2000},
+		{Org: "golang", Name: "tools", Category: "Go Core", Stars: 7000},
+		{Org: "golang", Name: "mod", Category: "Go Core", Stars: 1000},
+		{Org: "golang", Name: "sync", Category: "Go Core", Stars: 1000},
+		{Org: "golang", Name: "text", Category: "Go Core", Stars: 1500},
+		{Org: "golang", Name: "exp", Category: "Go Core", Stars: 2000},
+		{Org: "golang", Name: "vuln", Category: "TLS/Security", Stars: 3000},
+		{Org: "golang", Name: "time", Category: "Go Core", Stars: 500},
+		{Org: "etcd-io", Name: "etcd", Category: "TLS/Security", Stars: 46000},
+		{Org: "etcd-io", Name: "raft", Category: "Go Tools", Stars: 1000},
+		{Org: "etcd-io", Name: "gofail", Category: "Go Tools", Stars: 300},
+		{Org: "etcd-io", Name: "bbolt", Category: "Go Tools", Stars: 8000},
+		{Org: "syndtr", Name: "goleveldb", Category: "Go Tools", Stars: 6000},
+		{Org: "dgraph-io", Name: "badger", Category: "Go Tools", Stars: 14000},
+		{Org: "blevesearch", Name: "bleve", Category: "Go Tools", Stars: 11000},
+		{Org: "machadovilaca", Name: "operator-builder", Category: "Kubernetes", Stars: 200},
+		{Org: "operator-framework", Name: "operator-lifecycle-manager", Category: "Kubernetes", Stars: 3000},
 	}
 
 	sort.Slice(f.projects, func(i, j int) bool {
@@ -534,112 +977,926 @@ func (f *IssueFinder) initializeProjects() {
 func (f *IssueFinder) FindIssues(ctx context.Context) ([]Issue, error) {
 	var allIssues []Issue
 	var mu sync.Mutex
-	var wg sync.WaitGroup
+	var projectWg sync.WaitGroup
+	var collectorWg sync.WaitGroup
 
 	issuesChan := make(chan Issue, 100)
 
-	workerCount := 5
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for issue := range issuesChan {
-				mu.Lock()
-				allIssues = append(allIssues, issue)
-				mu.Unlock()
-			}
-		}()
+	collectorWg.Add(1)
+	go func() {
+		defer collectorWg.Done()
+		for issue := range issuesChan {
+			mu.Lock()
+			allIssues = append(allIssues, issue)
+			mu.Unlock()
+		}
+	}()
+
+	batchSize := 20
+	maxProjects := 50
+	projectsToCheck := f.projects
+	if len(projectsToCheck) > maxProjects {
+		projectsToCheck = f.projects[:maxProjects]
+		log.Printf("[Rate Limit] Processing %d projects (of %d total)", maxProjects, len(f.projects))
 	}
 
-	for _, project := range f.projects {
-		wg.Add(1)
-		go func(p Project) {
-			defer wg.Done()
+	for i := 0; i < len(projectsToCheck); i += batchSize {
+		end := i + batchSize
+		if end > len(projectsToCheck) {
+			end = len(projectsToCheck)
+		}
 
-			log.Printf("Checking issues for %s/%s (%d stars)", p.Org, p.Name, p.Stars)
+		log.Printf("[Rate Limit] Processing batch %d-%d of %d projects", i+1, end, len(projectsToCheck))
 
-			opts := &github.IssueListByRepoOptions{
-				State:     "open",
-				Sort:      "created",
-				Direction: "desc",
-				ListOptions: github.ListOptions{
-					PerPage: f.config.MaxIssuesPerRepo,
-				},
-			}
+		for j := i; j < end; j++ {
+			project := projectsToCheck[j]
+			projectWg.Add(1)
+			go func(p Project) {
+				defer projectWg.Done()
 
-			issues, _, err := f.client.Issues.ListByRepo(ctx, p.Org, p.Name, opts)
-			if err != nil {
-				log.Printf("Error fetching issues for %s/%s: %v", p.Org, p.Name, err)
-				return
-			}
+				log.Printf("Checking issues for %s/%s (%d stars)", p.Org, p.Name, p.Stars)
 
-			for _, issue := range issues {
-				if issue.IsPullRequest() {
-					continue
+				var issues []*github.Issue
+				var err error
+
+				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+					opts := &github.IssueListByRepoOptions{
+						State:     "open",
+						Sort:      "created",
+						Direction: "desc",
+						ListOptions: github.ListOptions{
+							PerPage: f.config.MaxIssuesPerRepo,
+						},
+					}
+
+					var apiErr error
+					issues, _, apiErr = f.client.Issues.ListByRepo(ctx, p.Org, p.Name, opts)
+					return nil, apiErr
+				})
+
+				if err != nil {
+					log.Printf("Error fetching issues for %s/%s: %v", p.Org, p.Name, err)
+					return
 				}
 
-				issueID := fmt.Sprintf("%s/%d", p.Name, *issue.Number)
+				log.Printf("Found %d issues for %s/%s", len(issues), p.Org, p.Name)
 
-				f.mu.RLock()
-				seen := f.seenIssues[issueID]
-				f.mu.RUnlock()
+				issuesAdded := 0
+				for _, issue := range issues {
+					if issue.IsPullRequest() {
+						continue
+					}
 
-				if seen {
-					continue
-				}
+					if len(issue.Assignees) > 0 {
+						continue
+					}
 
-				score := f.scorer.ScoreIssue(issue, p)
+					if issue.GetState() == "closed" {
+						continue
+					}
 
-				labels := make([]string, 0, len(issue.Labels))
-				for _, label := range issue.Labels {
-					labels = append(labels, label.GetName())
-				}
+					issueID := fmt.Sprintf("%s/%d", p.Name, *issue.Number)
 
-				isGoodFirst := false
-				for _, label := range issue.Labels {
-					if strings.Contains(strings.ToLower(label.GetName()), "good first issue") {
-						isGoodFirst = true
-						break
+					f.mu.RLock()
+					seen := f.seenIssues[issueID]
+					f.mu.RUnlock()
+
+					if seen {
+						continue
+					}
+
+					score := f.scorer.ScoreIssue(issue, p)
+
+					labels := make([]string, 0, len(issue.Labels))
+					for _, label := range issue.Labels {
+						labels = append(labels, label.GetName())
+					}
+
+					isGoodFirst := false
+					for _, label := range issue.Labels {
+						if strings.Contains(strings.ToLower(label.GetName()), "good first issue") {
+							isGoodFirst = true
+							break
+						}
+					}
+
+					newIssue := Issue{
+						Project:     p,
+						Title:       *issue.Title,
+						URL:         *issue.HTMLURL,
+						Number:      *issue.Number,
+						Score:       score,
+						CreatedAt:   issue.CreatedAt.Time,
+						Comments:    *issue.Comments,
+						Labels:      labels,
+						Language:    "Go",
+						IsGoodFirst: isGoodFirst,
+					}
+
+					issuesChan <- newIssue
+					issuesAdded++
+
+					if err := f.markIssueSeen(issueID, p.Name); err != nil {
+						log.Printf("Error marking issue %s as seen: %v", issueID, err)
+					}
+
+					if err := f.saveIssueHistory(newIssue); err != nil {
+						log.Printf("Error saving issue history: %v", err)
 					}
 				}
+				log.Printf("Added %d new issues from %s/%s", issuesAdded, p.Org, p.Name)
+			}(project)
+		}
 
-				newIssue := Issue{
-					Project:     p,
-					Title:       *issue.Title,
-					URL:         *issue.HTMLURL,
-					Number:      *issue.Number,
-					Score:       score,
-					CreatedAt:   issue.CreatedAt.Time,
-					Comments:    *issue.Comments,
-					Labels:      labels,
-					Language:    "Go",
-					IsGoodFirst: isGoodFirst,
-				}
+		projectWg.Wait()
 
-				issuesChan <- newIssue
-
-				if err := f.markIssueSeen(issueID, p.Name); err != nil {
-					log.Printf("Error marking issue %s as seen: %v", issueID, err)
-				}
-
-				if err := f.saveIssueHistory(newIssue); err != nil {
-					log.Printf("Error saving issue history: %v", err)
-				}
-			}
-		}(project)
+		if end < len(projectsToCheck) {
+			log.Printf("[Rate Limit] Batch complete, pausing briefly before next batch...")
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
 
-	wg.Wait()
 	close(issuesChan)
+	log.Printf("[Finder] Waiting for issue processors to finish...")
+	collectorWg.Wait()
+	log.Printf("[Finder] Processed %d total issues, sorting by score...", len(allIssues))
 
 	sort.Slice(allIssues, func(i, j int) bool {
 		return allIssues[i].Score > allIssues[j].Score
 	})
 
+	log.Printf("[Finder] Returning %d sorted issues", len(allIssues))
 	return allIssues, nil
 }
 
+func (f *IssueFinder) FindGoodFirstIssues(ctx context.Context, categories []string) ([]Issue, error) {
+	var allIssues []Issue
+	var mu sync.Mutex
+	var projectWg sync.WaitGroup
+	var collectorWg sync.WaitGroup
+
+	issuesChan := make(chan Issue, 100)
+
+	collectorWg.Add(1)
+	go func() {
+		defer collectorWg.Done()
+		for issue := range issuesChan {
+			mu.Lock()
+			allIssues = append(allIssues, issue)
+			mu.Unlock()
+		}
+	}()
+
+	categorySet := make(map[string]bool)
+	for _, c := range categories {
+		categorySet[strings.ToLower(c)] = true
+	}
+
+	var filteredProjects []Project
+	for _, p := range f.projects {
+		if len(categorySet) == 0 || categorySet[strings.ToLower(p.Category)] {
+			filteredProjects = append(filteredProjects, p)
+		}
+	}
+
+	maxProjects := 30
+	if len(filteredProjects) > maxProjects {
+		filteredProjects = filteredProjects[:maxProjects]
+	}
+	log.Printf("[Good First Issues] Checking %d projects in categories: %v", len(filteredProjects), categories)
+
+	batchSize := 10
+	for i := 0; i < len(filteredProjects); i += batchSize {
+		end := i + batchSize
+		if end > len(filteredProjects) {
+			end = len(filteredProjects)
+		}
+
+		log.Printf("[Good First Issues] Processing batch %d-%d", i+1, end)
+
+		for j := i; j < end; j++ {
+			project := filteredProjects[j]
+			projectWg.Add(1)
+			go func(p Project) {
+				defer projectWg.Done()
+
+				var issues []*github.Issue
+				var err error
+
+				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch good first issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+					opts := &github.IssueListByRepoOptions{
+						State:     "open",
+						Sort:      "created",
+						Direction: "desc",
+						Labels:    []string{"good first issue"},
+						ListOptions: github.ListOptions{
+							PerPage: 20,
+						},
+					}
+
+					var apiErr error
+					issues, _, apiErr = f.client.Issues.ListByRepo(ctx, p.Org, p.Name, opts)
+					return nil, apiErr
+				})
+
+				if err != nil {
+					log.Printf("Error fetching good first issues for %s/%s: %v", p.Org, p.Name, err)
+					return
+				}
+
+				if len(issues) > 0 {
+					log.Printf("Found %d good first issues for %s/%s", len(issues), p.Org, p.Name)
+				}
+
+				for _, issue := range issues {
+					if issue.IsPullRequest() {
+						continue
+					}
+
+					if len(issue.Assignees) > 0 {
+						continue
+					}
+
+					if issue.GetState() == "closed" {
+						continue
+					}
+
+					issueID := fmt.Sprintf("%s/%d", p.Name, *issue.Number)
+
+					f.mu.RLock()
+					seen := f.seenIssues[issueID]
+					f.mu.RUnlock()
+
+					if seen {
+						continue
+					}
+
+					score := f.scorer.ScoreIssue(issue, p) + 0.3
+
+					labels := make([]string, 0, len(issue.Labels))
+					for _, label := range issue.Labels {
+						labels = append(labels, label.GetName())
+					}
+
+					isGoodFirst := true
+
+					newIssue := Issue{
+						Project:     p,
+						Title:       *issue.Title,
+						URL:         *issue.HTMLURL,
+						Number:      *issue.Number,
+						Score:       score,
+						CreatedAt:   issue.CreatedAt.Time,
+						Comments:    *issue.Comments,
+						Labels:      labels,
+						Language:    "Go",
+						IsGoodFirst: isGoodFirst,
+					}
+
+					issuesChan <- newIssue
+				}
+			}(project)
+		}
+
+		projectWg.Wait()
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	close(issuesChan)
+	collectorWg.Wait()
+
+	sort.Slice(allIssues, func(i, j int) bool {
+		return allIssues[i].Score > allIssues[j].Score
+	})
+
+	log.Printf("[Good First Issues] Found %d issues", len(allIssues))
+	return allIssues, nil
+}
+
+func PrintGoodFirstIssues(issues []Issue, title string) {
+	fmt.Printf("\n%s\n", title)
+	fmt.Println(strings.Repeat("=", 80))
+
+	if len(issues) == 0 {
+		fmt.Println("No good first issues found.")
+		return
+	}
+
+	for i, issue := range issues {
+		if i >= 30 {
+			break
+		}
+
+		emoji := "🔥"
+		if issue.Score < 0.8 {
+			emoji = "⭐"
+		}
+		if issue.Score < 0.6 {
+			emoji = "✨"
+		}
+
+		fmt.Printf("\n%s [%d] %s\n", emoji, i+1, issue.Title)
+		fmt.Printf("   Score: %.2f | %s/%s (%d★) | Comments: %d\n", issue.Score, issue.Project.Org, issue.Project.Name, issue.Project.Stars, issue.Comments)
+		fmt.Printf("   Category: %s\n", issue.Project.Category)
+		fmt.Printf("   URL: %s\n", issue.URL)
+		if len(issue.Labels) > 0 {
+			fmt.Printf("   Labels: %s\n", strings.Join(issue.Labels, ", "))
+		}
+		fmt.Printf("   Created: %s\n", issue.CreatedAt.Format("2006-01-02"))
+		fmt.Println(strings.Repeat("-", 80))
+	}
+}
+
+func PrintIssuesByCategory(issues []Issue) {
+	categories := make(map[string][]Issue)
+	for _, issue := range issues {
+		cat := issue.Project.Category
+		categories[cat] = append(categories[cat], issue)
+	}
+
+	for cat, catIssues := range categories {
+		sort.Slice(catIssues, func(i, j int) bool {
+			return catIssues[i].Score > catIssues[j].Score
+		})
+
+		fmt.Printf("\n\nCategory: %s (%d issues)\n", cat, len(catIssues))
+		fmt.Println(strings.Repeat("-", 80))
+
+		for i, issue := range catIssues {
+			if i >= 10 {
+				break
+			}
+
+			emoji := "🔥"
+			if issue.Score < 0.8 {
+				emoji = "⭐"
+			}
+			if issue.Score < 0.6 {
+				emoji = "✨"
+			}
+
+			fmt.Printf("%s [%d] %s (%.2f)\n", emoji, i+1, truncateString(issue.Title, 60), issue.Score)
+			fmt.Printf("    %s/%s | %s\n", issue.Project.Org, issue.Project.Name, issue.URL)
+		}
+	}
+}
+
+func (f *IssueFinder) FindActionableIssues(ctx context.Context) ([]Issue, error) {
+	actionableProjects := []Project{
+		{Org: "golang", Name: "go", Category: "Go Core", Stars: 125000},
+		{Org: "golang", Name: "crypto", Category: "TLS/Security", Stars: 3000},
+		{Org: "golang", Name: "net", Category: "TLS/Security", Stars: 3000},
+		{Org: "hashicorp", Name: "vault", Category: "TLS/Security", Stars: 29000},
+		{Org: "hashicorp", Name: "consul", Category: "TLS/Security", Stars: 27000},
+		{Org: "hashicorp", Name: "nomad", Category: "TLS/Security", Stars: 14000},
+		{Org: "hashicorp", Name: "boundary", Category: "TLS/Security", Stars: 5000},
+		{Org: "kubernetes", Name: "kubernetes", Category: "TLS/Security", Stars: 105000},
+		{Org: "etcd-io", Name: "etcd", Category: "TLS/Security", Stars: 46000},
+		{Org: "prometheus", Name: "prometheus", Category: "TLS/Security", Stars: 53000},
+		{Org: "prometheus", Name: "alertmanager", Category: "TLS/Security", Stars: 6500},
+		{Org: "grafana", Name: "grafana", Category: "TLS/Security", Stars: 58000},
+		{Org: "grafana", Name: "loki", Category: "TLS/Security", Stars: 21000},
+		{Org: "grafana", Name: "tempo", Category: "TLS/Security", Stars: 5500},
+		{Org: "cilium", Name: "cilium", Category: "TLS/Security", Stars: 18000},
+		{Org: "istio", Name: "istio", Category: "TLS/Security", Stars: 35000},
+		{Org: "traefik", Name: "traefik", Category: "TLS/Security", Stars: 50000},
+		{Org: "caddyserver", Name: "caddy", Category: "TLS/Security", Stars: 58000},
+		{Org: "grpc", Name: "grpc-go", Category: "TLS/Security", Stars: 21000},
+		{Org: "coredns", Name: "coredns", Category: "TLS/Security", Stars: 11000},
+		{Org: "minio", Name: "minio", Category: "TLS/Security", Stars: 45000},
+		{Org: "containerd", Name: "containerd", Category: "TLS/Security", Stars: 15000},
+		{Org: "helm", Name: "helm", Category: "TLS/Security", Stars: 25000},
+		{Org: "argoproj", Name: "argo-cd", Category: "TLS/Security", Stars: 15000},
+		{Org: "argoproj", Name: "argo-workflows", Category: "TLS/Security", Stars: 14000},
+		{Org: "fluxcd", Name: "flux2", Category: "TLS/Security", Stars: 6000},
+		{Org: "dapr", Name: "dapr", Category: "TLS/Security", Stars: 24000},
+		{Org: "open-telemetry", Name: "opentelemetry-go", Category: "TLS/Security", Stars: 4500},
+		{Org: "open-telemetry", Name: "opentelemetry-collector", Category: "TLS/Security", Stars: 3500},
+		{Org: "jaegertracing", Name: "jaeger", Category: "TLS/Security", Stars: 19000},
+		{Org: "cert-manager", Name: "cert-manager", Category: "TLS/Security", Stars: 12000},
+		{Org: "tailscale", Name: "tailscale", Category: "TLS/Security", Stars: 20000},
+		{Org: "stretchr", Name: "testify", Category: "Go Tools", Stars: 23000},
+		{Org: "spf13", Name: "cobra", Category: "Go Tools", Stars: 38000},
+		{Org: "spf13", Name: "viper", Category: "Go Tools", Stars: 27000},
+		{Org: "gin-gonic", Name: "gin", Category: "Go Web", Stars: 77000},
+		{Org: "labstack", Name: "echo", Category: "Go Web", Stars: 30000},
+		{Org: "gorilla", Name: "mux", Category: "Go Web", Stars: 21000},
+		{Org: "go-gorm", Name: "gorm", Category: "Go Tools", Stars: 37000},
+		{Org: "go-redis", Name: "redis", Category: "TLS/Security", Stars: 20000},
+	}
+
+	var allIssues []Issue
+	var mu sync.Mutex
+	var projectWg sync.WaitGroup
+	var collectorWg sync.WaitGroup
+
+	issuesChan := make(chan Issue, 100)
+
+	collectorWg.Add(1)
+	go func() {
+		defer collectorWg.Done()
+		for issue := range issuesChan {
+			mu.Lock()
+			allIssues = append(allIssues, issue)
+			mu.Unlock()
+		}
+	}()
+
+	excludeKeywords := []string{"go 1.26", "go1.26", "golang 1.26", "go 1.27", "go1.27", "upgrade to go", "bump go version"}
+
+	log.Printf("[Actionable] Searching %d TLS-enabled Go projects for actionable issues...", len(actionableProjects))
+
+	batchSize := 10
+	for i := 0; i < len(actionableProjects); i += batchSize {
+		end := i + batchSize
+		if end > len(actionableProjects) {
+			end = len(actionableProjects)
+		}
+
+		log.Printf("[Actionable] Processing batch %d-%d", i+1, end)
+
+		for j := i; j < end; j++ {
+			project := actionableProjects[j]
+			projectWg.Add(1)
+			go func(p Project) {
+				defer projectWg.Done()
+
+				var issues []*github.Issue
+				var err error
+
+				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+					opts := &github.IssueListByRepoOptions{
+						State:     "open",
+						Sort:      "created",
+						Direction: "desc",
+						ListOptions: github.ListOptions{
+							PerPage: 30,
+						},
+					}
+
+					var apiErr error
+					issues, _, apiErr = f.client.Issues.ListByRepo(ctx, p.Org, p.Name, opts)
+					return nil, apiErr
+				})
+
+				if err != nil {
+					log.Printf("Error fetching issues for %s/%s: %v", p.Org, p.Name, err)
+					return
+				}
+
+				for _, issue := range issues {
+					if issue.IsPullRequest() {
+						continue
+					}
+
+					if len(issue.Assignees) > 0 {
+						continue
+					}
+
+					if issue.GetState() == "closed" {
+						continue
+					}
+
+					title := strings.ToLower(safeString(issue.Title))
+					body := strings.ToLower(safeString(issue.Body))
+					combinedText := title + " " + body
+
+					isExcluded := false
+					for _, kw := range excludeKeywords {
+						if strings.Contains(combinedText, strings.ToLower(kw)) {
+							isExcluded = true
+							break
+						}
+					}
+					if isExcluded {
+						continue
+					}
+
+					labels := make([]string, 0, len(issue.Labels))
+					hasGoodFirst := false
+					hasHelpWanted := false
+					hasBug := false
+					hasEnhancement := false
+
+					for _, label := range issue.Labels {
+						labelName := strings.ToLower(label.GetName())
+						labels = append(labels, label.GetName())
+						if strings.Contains(labelName, "good first issue") {
+							hasGoodFirst = true
+						}
+						if strings.Contains(labelName, "help wanted") {
+							hasHelpWanted = true
+						}
+						if strings.Contains(labelName, "bug") {
+							hasBug = true
+						}
+						if strings.Contains(labelName, "enhancement") || strings.Contains(labelName, "feature") {
+							hasEnhancement = true
+						}
+					}
+
+					if !hasGoodFirst && !hasHelpWanted && !hasBug && !hasEnhancement {
+						continue
+					}
+
+					issueID := fmt.Sprintf("%s/%d", p.Name, *issue.Number)
+
+					f.mu.RLock()
+					seen := f.seenIssues[issueID]
+					f.mu.RUnlock()
+
+					if seen {
+						continue
+					}
+
+					score := 0.6
+					if hasGoodFirst {
+						score += 0.25
+					}
+					if hasHelpWanted {
+						score += 0.20
+					}
+					if hasBug {
+						score += 0.10
+					}
+					if hasEnhancement {
+						score += 0.05
+					}
+					if *issue.Comments <= 2 {
+						score += 0.15
+					} else if *issue.Comments <= 5 {
+						score += 0.10
+					}
+					age := time.Since(issue.CreatedAt.Time).Hours()
+					if age <= 72 {
+						score += 0.15
+					} else if age <= 168 {
+						score += 0.10
+					}
+
+					if score > 1.5 {
+						score = 1.5
+					}
+
+					newIssue := Issue{
+						Project:     p,
+						Title:       *issue.Title,
+						URL:         *issue.HTMLURL,
+						Number:      *issue.Number,
+						Score:       score,
+						CreatedAt:   issue.CreatedAt.Time,
+						Comments:    *issue.Comments,
+						Labels:      labels,
+						Language:    "Go",
+						IsGoodFirst: hasGoodFirst,
+					}
+
+					issuesChan <- newIssue
+				}
+			}(project)
+		}
+
+		projectWg.Wait()
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	close(issuesChan)
+	collectorWg.Wait()
+
+	sort.Slice(allIssues, func(i, j int) bool {
+		return allIssues[i].Score > allIssues[j].Score
+	})
+
+	log.Printf("[Actionable] Found %d actionable issues", len(allIssues))
+	return allIssues, nil
+}
+
+func PrintActionableIssues(issues []Issue) {
+	fmt.Printf("\n%s\n", "ACTIONABLE ISSUES FROM TLS-ENABLED GO PROJECTS")
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Println("(Good First Issues, Bugs, Enhancements - No Go 1.26 Required)")
+	fmt.Println(strings.Repeat("-", 80))
+
+	if len(issues) == 0 {
+		fmt.Println("No actionable issues found.")
+		return
+	}
+
+	fmt.Printf("\nTotal Found: %d issues\n\n", len(issues))
+
+	goodFirstIssues := []Issue{}
+	bugIssues := []Issue{}
+	enhancementIssues := []Issue{}
+
+	for _, issue := range issues {
+		isGoodFirst := false
+		isBug := false
+		isEnhancement := false
+
+		for _, label := range issue.Labels {
+			labelLower := strings.ToLower(label)
+			if strings.Contains(labelLower, "good first issue") {
+				isGoodFirst = true
+			}
+			if strings.Contains(labelLower, "bug") {
+				isBug = true
+			}
+			if strings.Contains(labelLower, "enhancement") || strings.Contains(labelLower, "feature") {
+				isEnhancement = true
+			}
+		}
+
+		if isGoodFirst {
+			goodFirstIssues = append(goodFirstIssues, issue)
+		} else if isBug {
+			bugIssues = append(bugIssues, issue)
+		} else if isEnhancement {
+			enhancementIssues = append(enhancementIssues, issue)
+		}
+	}
+
+	if len(goodFirstIssues) > 0 {
+		fmt.Printf("\n🔥 GOOD FIRST ISSUES (%d issues)\n", len(goodFirstIssues))
+		fmt.Println(strings.Repeat("-", 80))
+		for i, issue := range goodFirstIssues {
+			if i >= 15 {
+				break
+			}
+			fmt.Printf("\n✅ [%d] %s (Score: %.2f)\n", i+1, issue.Title, issue.Score)
+			fmt.Printf("   Project: %s/%s (%d★) | %s\n", issue.Project.Org, issue.Project.Name, issue.Project.Stars, issue.Project.Category)
+			fmt.Printf("   Comments: %d | Created: %s\n", issue.Comments, issue.CreatedAt.Format("2006-01-02"))
+			fmt.Printf("   URL: %s\n", issue.URL)
+			if len(issue.Labels) > 0 {
+				fmt.Printf("   Labels: %s\n", strings.Join(issue.Labels, ", "))
+			}
+		}
+	}
+
+	if len(bugIssues) > 0 {
+		fmt.Printf("\n\n🐛 BUG ISSUES (%d issues)\n", len(bugIssues))
+		fmt.Println(strings.Repeat("-", 80))
+		for i, issue := range bugIssues {
+			if i >= 10 {
+				break
+			}
+			fmt.Printf("\n🔴 [%d] %s (Score: %.2f)\n", i+1, issue.Title, issue.Score)
+			fmt.Printf("   Project: %s/%s (%d★) | %s\n", issue.Project.Org, issue.Project.Name, issue.Project.Stars, issue.Project.Category)
+			fmt.Printf("   Comments: %d | Created: %s\n", issue.Comments, issue.CreatedAt.Format("2006-01-02"))
+			fmt.Printf("   URL: %s\n", issue.URL)
+		}
+	}
+
+	if len(enhancementIssues) > 0 {
+		fmt.Printf("\n\n✨ ENHANCEMENT ISSUES (%d issues)\n", len(enhancementIssues))
+		fmt.Println(strings.Repeat("-", 80))
+		for i, issue := range enhancementIssues {
+			if i >= 10 {
+				break
+			}
+			fmt.Printf("\n🟢 [%d] %s (Score: %.2f)\n", i+1, issue.Title, issue.Score)
+			fmt.Printf("   Project: %s/%s (%d★) | %s\n", issue.Project.Org, issue.Project.Name, issue.Project.Stars, issue.Project.Category)
+			fmt.Printf("   Comments: %d | Created: %s\n", issue.Comments, issue.CreatedAt.Format("2006-01-02"))
+			fmt.Printf("   URL: %s\n", issue.URL)
+		}
+	}
+}
+
+func (f *IssueFinder) FindGoUpgradeIssues(ctx context.Context) ([]Issue, error) {
+	tlsProjects := []Project{
+		{Org: "golang", Name: "go", Category: "Go Core", Stars: 125000},
+		{Org: "golang", Name: "crypto", Category: "Go TLS", Stars: 3000},
+		{Org: "golang", Name: "net", Category: "Go TLS", Stars: 3000},
+		{Org: "gorilla", Name: "mux", Category: "Go Web", Stars: 21000},
+		{Org: "gin-gonic", Name: "gin", Category: "Go Web", Stars: 77000},
+		{Org: "labstack", Name: "echo", Category: "Go Web", Stars: 30000},
+		{Org: "go-chi", Name: "chi", Category: "Go Web", Stars: 18000},
+		{Org: "grpc", Name: "grpc-go", Category: "Go TLS", Stars: 21000},
+		{Org: "etcd-io", Name: "etcd", Category: "Go TLS", Stars: 46000},
+		{Org: "hashicorp", Name: "vault", Category: "Go TLS", Stars: 29000},
+		{Org: "hashicorp", Name: "consul", Category: "Go TLS", Stars: 27000},
+		{Org: "hashicorp", Name: "nomad", Category: "Go TLS", Stars: 14000},
+		{Org: "kubernetes", Name: "kubernetes", Category: "Go TLS", Stars: 105000},
+		{Org: "prometheus", Name: "prometheus", Category: "Go TLS", Stars: 53000},
+		{Org: "prometheus", Name: "alertmanager", Category: "Go TLS", Stars: 6500},
+		{Org: "grafana", Name: "loki", Category: "Go TLS", Stars: 21000},
+		{Org: "grafana", Name: "tempo", Category: "Go TLS", Stars: 5500},
+		{Org: "cilium", Name: "cilium", Category: "Go TLS", Stars: 18000},
+		{Org: "linkerd", Name: "linkerd2", Category: "Go TLS", Stars: 10000},
+		{Org: "istio", Name: "istio", Category: "Go TLS", Stars: 35000},
+		{Org: "envoyproxy", Name: "gateway", Category: "Go TLS", Stars: 4000},
+		{Org: "traefik", Name: "traefik", Category: "Go TLS", Stars: 50000},
+		{Org: "caddyserver", Name: "caddy", Category: "Go TLS", Stars: 58000},
+		{Org: "coredns", Name: "coredns", Category: "Go TLS", Stars: 11000},
+		{Org: "mongodb", Name: "mongo-go-driver", Category: "Go TLS", Stars: 8000},
+		{Org: "go-sql-driver", Name: "mysql", Category: "Go TLS", Stars: 14000},
+		{Org: "lib", Name: "pq", Category: "Go TLS", Stars: 9000},
+		{Org: "redis", Name: "go-redis", Category: "Go TLS", Stars: 20000},
+		{Org: "go-redis", Name: "redis", Category: "Go TLS", Stars: 20000},
+		{Org: "minio", Name: "minio", Category: "Go TLS", Stars: 45000},
+		{Org: "docker", Name: "distribution", Category: "Go TLS", Stars: 9000},
+		{Org: "containerd", Name: "containerd", Category: "Go TLS", Stars: 15000},
+		{Org: "moby", Name: "moby", Category: "Go TLS", Stars: 68000},
+		{Org: "opencontainers", Name: "runc", Category: "Go TLS", Stars: 12000},
+		{Org: "helm", Name: "helm", Category: "Go TLS", Stars: 25000},
+		{Org: "argoproj", Name: "argo-cd", Category: "Go TLS", Stars: 15000},
+		{Org: "argoproj", Name: "argo-workflows", Category: "Go TLS", Stars: 14000},
+		{Org: "fluxcd", Name: "flux2", Category: "Go TLS", Stars: 6000},
+		{Org: "tektoncd", Name: "pipeline", Category: "Go TLS", Stars: 8000},
+		{Org: "knative", Name: "serving", Category: "Go TLS", Stars: 5000},
+		{Org: "knative", Name: "eventing", Category: "Go TLS", Stars: 4000},
+		{Org: "dapr", Name: "dapr", Category: "Go TLS", Stars: 24000},
+		{Org: "open-telemetry", Name: "opentelemetry-go", Category: "Go TLS", Stars: 4500},
+		{Org: "open-telemetry", Name: "opentelemetry-collector", Category: "Go TLS", Stars: 3500},
+		{Org: "jaegertracing", Name: "jaeger", Category: "Go TLS", Stars: 19000},
+		{Org: "zalando", Name: "skipper", Category: "Go TLS", Stars: 3000},
+		{Org: "projectcontour", Name: "contour", Category: "Go TLS", Stars: 3500},
+		{Org: "k8s-io", Name: "ingress-nginx", Category: "Go TLS", Stars: 17000},
+		{Org: "kubernetes", Name: "ingress-nginx", Category: "Go TLS", Stars: 17000},
+		{Org: "oauth2-proxy", Name: "oauth2-proxy", Category: "Go TLS", Stars: 9000},
+		{Org: "keycloak", Name: "keycloak", Category: "Go TLS", Stars: 22000},
+	}
+
+	var allIssues []Issue
+	var mu sync.Mutex
+	var projectWg sync.WaitGroup
+	var collectorWg sync.WaitGroup
+
+	issuesChan := make(chan Issue, 100)
+
+	collectorWg.Add(1)
+	go func() {
+		defer collectorWg.Done()
+		for issue := range issuesChan {
+			mu.Lock()
+			allIssues = append(allIssues, issue)
+			mu.Unlock()
+		}
+	}()
+
+	keywords := []string{"go 1.26", "golang 1.26", "go1.26", "upgrade go", "go version", "go 1.25", "golang 1.25", "go1.25", "go 1.27", "golang 1.27", "go1.27", "update go", "bump go", "go.mod"}
+
+	log.Printf("[Go Upgrade] Searching %d TLS-enabled Go projects for Go version upgrade issues...", len(tlsProjects))
+
+	batchSize := 10
+	for i := 0; i < len(tlsProjects); i += batchSize {
+		end := i + batchSize
+		if end > len(tlsProjects) {
+			end = len(tlsProjects)
+		}
+
+		log.Printf("[Go Upgrade] Processing batch %d-%d", i+1, end)
+
+		for j := i; j < end; j++ {
+			project := tlsProjects[j]
+			projectWg.Add(1)
+			go func(p Project) {
+				defer projectWg.Done()
+
+				var issues []*github.Issue
+				var err error
+
+				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+					opts := &github.IssueListByRepoOptions{
+						State:     "open",
+						Sort:      "created",
+						Direction: "desc",
+						ListOptions: github.ListOptions{
+							PerPage: 30,
+						},
+					}
+
+					var apiErr error
+					issues, _, apiErr = f.client.Issues.ListByRepo(ctx, p.Org, p.Name, opts)
+					return nil, apiErr
+				})
+
+				if err != nil {
+					log.Printf("Error fetching issues for %s/%s: %v", p.Org, p.Name, err)
+					return
+				}
+
+				for _, issue := range issues {
+					if issue.IsPullRequest() {
+						continue
+					}
+
+					if len(issue.Assignees) > 0 {
+						continue
+					}
+
+					if issue.GetState() == "closed" {
+						continue
+					}
+
+					title := strings.ToLower(safeString(issue.Title))
+					body := strings.ToLower(safeString(issue.Body))
+					combinedText := title + " " + body
+
+					isGoUpgrade := false
+					for _, kw := range keywords {
+						if strings.Contains(combinedText, strings.ToLower(kw)) {
+							isGoUpgrade = true
+							break
+						}
+					}
+
+					if !isGoUpgrade {
+						continue
+					}
+
+					issueID := fmt.Sprintf("%s/%d", p.Name, *issue.Number)
+
+					f.mu.RLock()
+					seen := f.seenIssues[issueID]
+					f.mu.RUnlock()
+
+					if seen {
+						continue
+					}
+
+					score := 0.85
+					if strings.Contains(combinedText, "go 1.26") || strings.Contains(combinedText, "go1.26") {
+						score = 1.0
+					} else if strings.Contains(combinedText, "go 1.25") || strings.Contains(combinedText, "go1.25") {
+						score = 0.95
+					} else if strings.Contains(combinedText, "upgrade") || strings.Contains(combinedText, "bump") {
+						score = 0.90
+					}
+
+					labels := make([]string, 0, len(issue.Labels))
+					for _, label := range issue.Labels {
+						labels = append(labels, label.GetName())
+					}
+
+					newIssue := Issue{
+						Project:     p,
+						Title:       *issue.Title,
+						URL:         *issue.HTMLURL,
+						Number:      *issue.Number,
+						Score:       score,
+						CreatedAt:   issue.CreatedAt.Time,
+						Comments:    *issue.Comments,
+						Labels:      labels,
+						Language:    "Go",
+						IsGoodFirst: false,
+					}
+
+					issuesChan <- newIssue
+				}
+			}(project)
+		}
+
+		projectWg.Wait()
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	close(issuesChan)
+	collectorWg.Wait()
+
+	sort.Slice(allIssues, func(i, j int) bool {
+		return allIssues[i].Score > allIssues[j].Score
+	})
+
+	log.Printf("[Go Upgrade] Found %d Go version upgrade issues in TLS-enabled projects", len(allIssues))
+	return allIssues, nil
+}
+
+func PrintGoUpgradeIssues(issues []Issue) {
+	fmt.Printf("\n%s\n", "GO VERSION UPGRADE ISSUES IN TLS-ENABLED PROJECTS")
+	fmt.Println(strings.Repeat("=", 80))
+
+	if len(issues) == 0 {
+		fmt.Println("No Go version upgrade issues found.")
+		return
+	}
+
+	fmt.Printf("\nTotal Found: %d issues\n", len(issues))
+	fmt.Println(strings.Repeat("-", 80))
+
+	for i, issue := range issues {
+		emoji := "🔥"
+		if issue.Score < 0.90 {
+			emoji = "⭐"
+		}
+		if issue.Score < 0.85 {
+			emoji = "✨"
+		}
+
+		fmt.Printf("\n%s [%d] %s (Score: %.2f)\n", emoji, i+1, issue.Title, issue.Score)
+		fmt.Printf("   Project: %s/%s (%d★) | Category: %s\n", issue.Project.Org, issue.Project.Name, issue.Project.Stars, issue.Project.Category)
+		fmt.Printf("   Comments: %d | Created: %s\n", issue.Comments, issue.CreatedAt.Format("2006-01-02"))
+		fmt.Printf("   URL: %s\n", issue.URL)
+		if len(issue.Labels) > 0 {
+			fmt.Printf("   Labels: %s\n", strings.Join(issue.Labels, ", "))
+		}
+		fmt.Println(strings.Repeat("-", 80))
+	}
+}
+
 func (f *IssueFinder) SendTelegramAlert(issues []Issue) error {
+	if f.bot == nil {
+		return nil
+	}
 	if len(issues) == 0 {
 		return nil
 	}
@@ -697,6 +1954,14 @@ func (f *IssueFinder) SendTelegramAlert(issues []Issue) error {
 	}
 
 	return nil
+}
+
+func (f *IssueFinder) SendLocalAlert(issues []Issue) error {
+	if f.notifier == nil {
+		return nil
+	}
+
+	return f.notifier.SendIssuesAlert(issues)
 }
 
 func (f *IssueFinder) GetTopIssues(limit int) ([]Issue, error) {
@@ -1092,14 +2357,82 @@ func truncateString(s string, maxLen int) string {
 	return s[:maxLen] + "..."
 }
 
+func loadEmailConfigFromEnv() *EmailConfig {
+	host := strings.TrimSpace(os.Getenv("SMTP_HOST"))
+	username := strings.TrimSpace(os.Getenv("SMTP_USERNAME"))
+	password := strings.TrimSpace(os.Getenv("SMTP_PASSWORD"))
+	from := strings.TrimSpace(os.Getenv("FROM_EMAIL"))
+	to := strings.TrimSpace(os.Getenv("TO_EMAIL"))
+	port := strings.TrimSpace(os.Getenv("SMTP_PORT"))
+
+	if host == "" || username == "" || password == "" || from == "" || to == "" {
+		return nil
+	}
+
+	if port == "" {
+		port = "587"
+	}
+
+	return &EmailConfig{
+		SMTPHost:     host,
+		SMTPPort:     port,
+		SMTPUsername: username,
+		SMTPPassword: password,
+		FromEmail:    from,
+		ToEmail:      to,
+	}
+}
+
 func main() {
+	chatID := int64(683539779)
+	if chatEnv := os.Getenv("TELEGRAM_CHAT_ID"); chatEnv != "" {
+		parsed, err := strconv.ParseInt(chatEnv, 10, 64)
+		if err != nil {
+			log.Printf("Invalid TELEGRAM_CHAT_ID value %q: %v", chatEnv, err)
+		}
+		chatID = parsed
+	}
+
+	checkInterval := 3600
+	if intervalEnv := os.Getenv("CHECK_INTERVAL"); intervalEnv != "" {
+		parsed, err := strconv.Atoi(intervalEnv)
+		if err != nil || parsed <= 0 {
+			log.Printf("Invalid CHECK_INTERVAL %q, using default %d seconds", intervalEnv, checkInterval)
+		} else {
+			checkInterval = parsed
+		}
+	}
+
+	maxIssues := 10
+	if maxEnv := os.Getenv("MAX_ISSUES_PER_REPO"); maxEnv != "" {
+		parsed, err := strconv.Atoi(maxEnv)
+		if err != nil || parsed <= 0 {
+			log.Printf("Invalid MAX_ISSUES_PER_REPO %q, using default %d", maxEnv, maxIssues)
+		} else {
+			maxIssues = parsed
+		}
+	}
+
+	dbConn := os.Getenv("DB_CONNECTION_STRING")
+	if dbConn == "" {
+		dbConn = "host=localhost user=postgres password=postgres dbname=issue_finder sslmode=disable port=5432"
+	}
+
+	emailConfig := loadEmailConfigFromEnv()
+	if emailConfig == nil {
+		log.Printf("Email notifications disabled: SMTP configuration incomplete")
+	} else {
+		log.Printf("Email notifications enabled for %s via %s", emailConfig.ToEmail, emailConfig.SMTPHost)
+	}
+
 	config := &Config{
 		GitHubToken:        os.Getenv("GITHUB_TOKEN"),
 		TelegramBotToken:   os.Getenv("TELEGRAM_BOT_TOKEN"),
-		TelegramChatID:     683539779,
-		CheckInterval:      3600,
-		MaxIssuesPerRepo:   10,
-		DBConnectionString: "host=localhost user=postgres password=postgres dbname=issue_finder sslmode=disable port=5432",
+		TelegramChatID:     chatID,
+		CheckInterval:      checkInterval,
+		MaxIssuesPerRepo:   maxIssues,
+		DBConnectionString: dbConn,
+		Email:              emailConfig,
 	}
 
 	if config.GitHubToken == "" {
@@ -1107,12 +2440,18 @@ func main() {
 	}
 
 	if config.TelegramBotToken == "" {
-		log.Fatal("TELEGRAM_BOT_TOKEN environment variable is required")
+		log.Printf("TELEGRAM_BOT_TOKEN not set, Telegram notifications disabled")
 	}
 
-	finder, err := NewIssueFinder(config)
+	notifier, err := NewLocalNotifier(emailConfig)
 	if err != nil {
-		log.Fatalf("Failed to create IssueFinder: %v", err)
+		log.Printf("Failed to initialize local notifier: %v", err)
+	}
+	defer notifier.Close()
+
+	finder, err := NewIssueFinder(config, notifier)
+	if err != nil {
+		log.Printf("Failed to create IssueFinder: %v", err)
 	}
 	defer finder.db.Close()
 
@@ -1124,12 +2463,134 @@ func main() {
 
 	go func() {
 		<-sigChan
-		log.Println("Received shutdown signal, stopping...")
+		log.Printf("Received shutdown signal, stopping...")
 		cancel()
 	}()
 
-	log.Println("Starting GitHub Issue Finder...")
-	log.Printf("Checking %d projects for good learning issues", len(finder.projects))
+	log.Printf("Starting GitHub Issue Finder...")
+	log.Printf("Checking %d projects for good learning issues", min(len(finder.projects), 30))
+
+	runCheck := func() {
+		log.Printf("Running issue check...")
+		if err := finder.rateLimiter.checkRateLimit(ctx); err != nil {
+			log.Printf("Warning: failed to check rate limit: %v", err)
+		}
+		issues, err := finder.FindIssues(ctx)
+		if err != nil {
+			log.Printf("Error finding issues: %v", err)
+			return
+		}
+
+		log.Printf("Found %d new issues", len(issues))
+
+		if len(issues) == 0 {
+			log.Printf("No new issues found")
+			return
+		}
+
+		log.Printf("Sending alerts for %d issues...", len(issues))
+
+		if err := finder.SendTelegramAlert(issues); err != nil {
+			log.Printf("Error sending Telegram alert: %v", err)
+		} else if finder.bot != nil {
+			log.Printf("Successfully sent Telegram alert for %d issues", len(issues))
+		}
+
+		log.Printf("Sending local/email alerts...")
+		if err := finder.SendLocalAlert(issues); err != nil {
+			log.Printf("Error processing local/email alert: %v", err)
+		} else if config.Email != nil {
+			log.Printf("Email/local alert delivered for %d issues", len(issues))
+		} else {
+			log.Printf("Logged %d issues locally (email disabled)", len(issues))
+		}
+		log.Printf("Alert processing complete")
+	}
+
+	runGoodFirstIssues := func() {
+		log.Printf("\n=== FINDING GOOD FIRST ISSUES ===")
+		log.Printf("Searching for 'good first issue' labeled issues in CNCF, DevOps, ML/AI projects...")
+
+		if err := finder.rateLimiter.checkRateLimit(ctx); err != nil {
+			log.Printf("Warning: failed to check rate limit: %v", err)
+		}
+
+		goodFirstIssues, err := finder.FindGoodFirstIssues(ctx, []string{"Kubernetes", "Monitoring", "CI/CD", "ML/AI"})
+		if err != nil {
+			log.Printf("Error finding good first issues: %v", err)
+			return
+		}
+
+		PrintGoodFirstIssues(goodFirstIssues, "GOOD FIRST ISSUES FROM CNCF, DEVOPS, ML/AI PROJECTS")
+
+		PrintIssuesByCategory(goodFirstIssues)
+
+		if notifier != nil {
+			notifier.logToFile(fmt.Sprintf("Found %d good first issues", len(goodFirstIssues)))
+			for _, issue := range goodFirstIssues {
+				if issue.Score >= 0.7 {
+					notifier.logToNotificationsFile(issue.Title, issue.URL, issue.Score, "Good First Issue")
+				}
+			}
+		}
+	}
+
+	mode := os.Getenv("MODE")
+	if mode == "good-first" {
+		runGoodFirstIssues()
+		return
+	}
+
+	if mode == "actionable" {
+		log.Printf("\n=== FINDING ACTIONABLE ISSUES (No Go 1.26 Required) ===")
+		log.Printf("Searching for good first issues, bugs, and enhancements from TLS-enabled Go projects...")
+		if err := finder.rateLimiter.checkRateLimit(ctx); err != nil {
+			log.Printf("Warning: failed to check rate limit: %v", err)
+		}
+		actionableIssues, err := finder.FindActionableIssues(ctx)
+		if err != nil {
+			log.Printf("Error finding actionable issues: %v", err)
+			return
+		}
+		PrintActionableIssues(actionableIssues)
+		if notifier != nil {
+			notifier.logToFile(fmt.Sprintf("Found %d actionable issues", len(actionableIssues)))
+			for _, issue := range actionableIssues {
+				notifier.logToNotificationsFile(issue.Title, issue.URL, issue.Score, "Actionable")
+			}
+		}
+		return
+	}
+
+	if mode == "go-upgrade" {
+		log.Printf("\n=== FINDING GO VERSION UPGRADE ISSUES IN TLS-ENABLED PROJECTS ===")
+		if err := finder.rateLimiter.checkRateLimit(ctx); err != nil {
+			log.Printf("Warning: failed to check rate limit: %v", err)
+		}
+		goUpgradeIssues, err := finder.FindGoUpgradeIssues(ctx)
+		if err != nil {
+			log.Printf("Error finding Go upgrade issues: %v", err)
+			return
+		}
+		PrintGoUpgradeIssues(goUpgradeIssues)
+		if notifier != nil {
+			notifier.logToFile(fmt.Sprintf("Found %d Go upgrade issues in TLS projects", len(goUpgradeIssues)))
+			for _, issue := range goUpgradeIssues {
+				notifier.logToNotificationsFile(issue.Title, issue.URL, issue.Score, "Go Upgrade")
+			}
+		}
+		return
+	}
+
+	if mode == "both" {
+		runCheck()
+		fmt.Println()
+		fmt.Println()
+		runGoodFirstIssues()
+		return
+	}
+
+	runCheck()
 
 	ticker := time.NewTicker(time.Duration(config.CheckInterval) * time.Second)
 	defer ticker.Stop()
@@ -1140,28 +2601,11 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				log.Println("Running issue check...")
-				issues, err := finder.FindIssues(ctx)
-				if err != nil {
-					log.Printf("Error finding issues: %v", err)
-					continue
-				}
-
-				log.Printf("Found %d new issues", len(issues))
-
-				if len(issues) > 0 {
-					if err := finder.SendTelegramAlert(issues); err != nil {
-						log.Printf("Error sending Telegram alert: %v", err)
-					} else {
-						log.Printf("Successfully sent Telegram alert for %d issues", len(issues))
-					}
-				} else {
-					log.Println("No new issues found")
-				}
+				runCheck()
 			}
 		}
 	}()
 
 	<-ctx.Done()
-	log.Println("Shutdown complete")
+	log.Printf("Shutdown complete")
 }

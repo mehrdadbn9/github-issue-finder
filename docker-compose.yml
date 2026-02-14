@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  github-issue-finder:
+    build: .
+    container_name: github-issue-finder
+    restart: unless-stopped
+    environment:
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-683539779}
+      - DB_CONNECTION_STRING=host=postgres user=postgres password=postgres dbname=issue_finder sslmode=disable
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-3600}
+      - MAX_ISSUES_PER_REPO=${MAX_ISSUES_PER_REPO:-10}
+      - MAX_PROJECTS=${MAX_PROJECTS:-50}
+      - LOG_DIR=/app/logs
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-}
+      - SMTP_USERNAME=${SMTP_USERNAME:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - FROM_EMAIL=${FROM_EMAIL:-}
+      - TO_EMAIL=${TO_EMAIL:-}
+    volumes:
+      - ./runtime/logs:/app/logs
+      - ./runtime/data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - issue-finder-network
+
+  postgres:
+    image: hub.hamdocker.ir/postgres:15-alpine
+    container_name: issue-finder-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=issue_finder
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - issue-finder-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:
+
+networks:
+  issue-finder-network:
+    driver: bridge
