@@ -54,18 +54,18 @@ type IssueAnalyzer struct {
 	avoidRepos map[string]bool
 }
 
-var defaultAvoidRepos = map[string]bool{
-	"golang/go":         true,
-	"grafana/grafana":   true,
-	"keycloak/keycloak": true,
-}
-
 func NewIssueAnalyzer(client *github.Client, commentMgr *CommentManager, username string) *IssueAnalyzer {
+	avoidRepos := map[string]bool{
+		"golang/go":         true,
+		"grafana/grafana":   true,
+		"keycloak/keycloak": true,
+		"caddyserver/caddy": true,
+	}
 	return &IssueAnalyzer{
 		client:     client,
 		commentMgr: commentMgr,
 		username:   username,
-		avoidRepos: defaultAvoidRepos,
+		avoidRepos: avoidRepos,
 	}
 }
 

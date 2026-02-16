@@ -18,6 +18,19 @@ type ContributionPolicy struct {
 	trustedRepos     map[string]*RepoStats
 	commentCooldown  time.Duration
 	newRepoThreshold int
+	openPRRepos      map[string]bool
+}
+
+var defaultAvoidRepos = map[string]bool{
+	"golang/go":         true,
+	"grafana/grafana":   true,
+	"keycloak/keycloak": true,
+	"caddyserver/caddy": true,
+}
+
+var userOpenPRRepos = map[string]bool{
+	"VictoriaMetrics/VictoriaMetrics": true,
+	"prometheus/alertmanager":         true,
 }
 
 type RepoStats struct {

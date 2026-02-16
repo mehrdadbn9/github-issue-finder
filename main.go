@@ -245,12 +245,37 @@ func (s *IssueScorer) ScoreIssue(issue *github.Issue, project Project) float64 {
 		score += 0.10
 	}
 
-	// CNCF projects bonus
-	cncfProjects := []string{"kubernetes", "prometheus", "etcd", "istio", "cilium", "containerd", "grpc", "helm", "dapr", "keda", "argo", "rancher", "velero", "traefik"}
+	// CNCF projects bonus - expanded list
+	cncfProjects := []string{
+		"kubernetes", "prometheus", "etcd", "istio", "cilium", "containerd", "grpc",
+		"helm", "dapr", "keda", "argo", "rancher", "velero", "traefik", "flux",
+		"knative", "opa", "cni", "cri-o", "runc", "coredns", "envoy", "linkerd",
+		"crossplane", "keptn", "openfeature", "backstage", "dragonfly", "vineyard",
+	}
 	if slices.ContainsFunc(cncfProjects, func(p string) bool {
 		return strings.Contains(strings.ToLower(project.Name), p)
 	}) {
-		score += 0.10
+		score += 0.15
+	}
+
+	// Learning-focused bonuses
+	// Good first issue - best for learning
+	if hasLabel(issue.Labels, "good first issue") || hasLabel(issue.Labels, "good-first-issue") {
+		score += 0.25
+	}
+
+	// Help wanted - maintainers actively seeking contributors
+	if hasLabel(issue.Labels, "help wanted") || hasLabel(issue.Labels, "help-wanted") {
+		score += 0.20
+	}
+
+	// Beginner-friendly labels
+	beginnerLabels := []string{"beginner", "starter", "easy", "newcomer", "first-timers-only"}
+	for _, label := range beginnerLabels {
+		if hasLabel(issue.Labels, label) {
+			score += 0.15
+			break
+		}
 	}
 
 	// Documentation-only issues - easier to contribute
