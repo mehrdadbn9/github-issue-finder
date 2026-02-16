@@ -53,6 +53,23 @@ const (
 	TrustMaintainer
 )
 
+func (t TrustLevel) String() string {
+	switch t {
+	case TrustNone:
+		return "None"
+	case TrustNew:
+		return "New"
+	case TrustContributor:
+		return "Contributor"
+	case TrustRegular:
+		return "Regular"
+	case TrustMaintainer:
+		return "Maintainer"
+	default:
+		return "Unknown"
+	}
+}
+
 type CommentPolicy struct {
 	MinTrustLevel     TrustLevel
 	RequireValidation bool

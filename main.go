@@ -42,6 +42,25 @@ type Issue struct {
 	IsGoodFirst bool
 }
 
+type IssueFilter struct {
+	MinScore      float64
+	MaxScore      float64
+	Categories    []string
+	MaxComments   int
+	MinStars      int
+	Labels        []string
+	ExcludeLabels []string
+	CreatedAfter  time.Time
+	CreatedBefore time.Time
+}
+
+type IssueResult struct {
+	Issues     []Issue
+	TotalCount int
+	Duration   time.Duration
+	Error      error
+}
+
 type IssueScorer struct {
 	weights map[string]float64
 }
@@ -2379,7 +2398,17 @@ func truncateString(s string, maxLen int) string {
 	if len(s) <= maxLen {
 		return s
 	}
-	return s[:maxLen] + "..."
+	if maxLen <= 3 {
+		return s[:maxLen]
+	}
+	return s[:maxLen-3] + "..."
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func loadEmailConfigFromEnv() *EmailConfig {

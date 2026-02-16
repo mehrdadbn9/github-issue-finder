@@ -372,3 +372,69 @@ func parseNumber(s string) int {
 	fmt.Sscanf(s, "%d", &n)
 	return n
 }
+
+func FilterIssues(issues []Issue, filter IssueFilter) []Issue {
+	var result []Issue
+	for _, issue := range issues {
+		if filter.MinScore > 0 && issue.Score < filter.MinScore {
+			continue
+		}
+		if filter.MaxScore > 0 && issue.Score > filter.MaxScore {
+			continue
+		}
+		if filter.MaxComments > 0 && issue.Comments > filter.MaxComments {
+			continue
+		}
+		if filter.MinStars > 0 && issue.Project.Stars < filter.MinStars {
+			continue
+		}
+		if !filter.CreatedAfter.IsZero() && issue.CreatedAt.Before(filter.CreatedAfter) {
+			continue
+		}
+		if !filter.CreatedBefore.IsZero() && issue.CreatedAt.After(filter.CreatedBefore) {
+			continue
+		}
+		if len(filter.Categories) > 0 {
+			found := false
+			for _, cat := range filter.Categories {
+				if issue.Project.Category == cat {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+		if len(filter.Labels) > 0 {
+			found := false
+			for _, reqLabel := range filter.Labels {
+				for _, issueLabel := range issue.Labels {
+					if issueLabel == reqLabel {
+						found = true
+						break
+					}
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+		if len(filter.ExcludeLabels) > 0 {
+			excluded := false
+			for _, exclLabel := range filter.ExcludeLabels {
+				for _, issueLabel := range issue.Labels {
+					if issueLabel == exclLabel {
+						excluded = true
+						break
+					}
+				}
+			}
+			if excluded {
+				continue
+			}
+		}
+		result = append(result, issue)
+	}
+	return result
+}

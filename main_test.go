@@ -282,3 +282,122 @@ func TestCloudProviderPenalty(t *testing.T) {
 func strPtr(s string) *string {
 	return &s
 }
+
+func TestFilterIssues(t *testing.T) {
+	issues := []Issue{
+		{
+			Title:     "High score issue",
+			Score:     1.2,
+			Comments:  2,
+			CreatedAt: time.Now().Add(-24 * time.Hour),
+			Labels:    []string{"bug", "good first issue"},
+			Project:   Project{Category: "Kubernetes", Stars: 50000},
+		},
+		{
+			Title:     "Low score issue",
+			Score:     0.3,
+			Comments:  10,
+			CreatedAt: time.Now().Add(-720 * time.Hour),
+			Labels:    []string{"enhancement"},
+			Project:   Project{Category: "ML/AI", Stars: 5000},
+		},
+		{
+			Title:     "Medium score issue",
+			Score:     0.7,
+			Comments:  5,
+			CreatedAt: time.Now().Add(-48 * time.Hour),
+			Labels:    []string{"help wanted"},
+			Project:   Project{Category: "Monitoring", Stars: 20000},
+		},
+	}
+
+	tests := []struct {
+		name     string
+		filter   IssueFilter
+		expected int
+	}{
+		{
+			name:     "no filter",
+			filter:   IssueFilter{},
+			expected: 3,
+		},
+		{
+			name:     "min score filter",
+			filter:   IssueFilter{MinScore: 0.5},
+			expected: 2,
+		},
+		{
+			name:     "max comments filter",
+			filter:   IssueFilter{MaxComments: 5},
+			expected: 2,
+		},
+		{
+			name:     "category filter",
+			filter:   IssueFilter{Categories: []string{"Kubernetes"}},
+			expected: 1,
+		},
+		{
+			name:     "min stars filter",
+			filter:   IssueFilter{MinStars: 25000},
+			expected: 1,
+		},
+		{
+			name:     "label filter",
+			filter:   IssueFilter{Labels: []string{"bug"}},
+			expected: 1,
+		},
+		{
+			name:     "exclude label filter",
+			filter:   IssueFilter{ExcludeLabels: []string{"enhancement"}},
+			expected: 2,
+		},
+		{
+			name:     "combined filters",
+			filter:   IssueFilter{MinScore: 0.5, MaxComments: 10},
+			expected: 2,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := FilterIssues(issues, tt.filter)
+			if len(result) != tt.expected {
+				t.Errorf("FilterIssues() returned %d issues, want %d", len(result), tt.expected)
+			}
+		})
+	}
+}
+
+func TestIssueFilterByRecency(t *testing.T) {
+	now := time.Now()
+	issues := []Issue{
+		{Title: "Recent", CreatedAt: now.Add(-12 * time.Hour)},
+		{Title: "Old", CreatedAt: now.Add(-720 * time.Hour)},
+	}
+
+	filter := IssueFilter{
+		CreatedAfter: now.Add(-48 * time.Hour),
+	}
+	result := FilterIssues(issues, filter)
+	if len(result) != 1 || result[0].Title != "Recent" {
+		t.Errorf("Expected 1 recent issue, got %d", len(result))
+	}
+}
+
+func TestMinFunction(t *testing.T) {
+	tests := []struct {
+		a, b, expected int
+	}{
+		{1, 2, 1},
+		{5, 3, 3},
+		{0, 0, 0},
+		{-1, 1, -1},
+	}
+
+	for _, tt := range tests {
+		result := min(tt.a, tt.b)
+		if result != tt.expected {
+			t.Errorf("min(%d, %d) = %d, want %d", tt.a, tt.b, result, tt.expected)
+		}
+	}
+}

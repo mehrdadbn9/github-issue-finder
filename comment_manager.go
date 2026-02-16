@@ -38,15 +38,27 @@ type CommentRecord struct {
 	ErrorMessage string    `db:"error_message"`
 }
 
+type CommentResult struct {
+	Posted    bool
+	IssueURL  string
+	Message   string
+	Error     error
+	Timestamp time.Time
+}
+
+func DefaultAntiSpamConfig() *AntiSpamConfig {
+	return &AntiSpamConfig{
+		MaxCommentsPerHour:    3,
+		MinIntervalBetween:    10 * time.Minute,
+		MaxCommentsPerProject: 1,
+		CooldownPeriod:        48 * time.Hour,
+		DailyLimit:            10,
+	}
+}
+
 func NewCommentManager(client *github.Client, db *sqlx.DB, config *AntiSpamConfig) *CommentManager {
 	if config == nil {
-		config = &AntiSpamConfig{
-			MaxCommentsPerHour:    3,
-			MinIntervalBetween:    10 * time.Minute,
-			MaxCommentsPerProject: 1,
-			CooldownPeriod:        48 * time.Hour,
-			DailyLimit:            10,
-		}
+		config = DefaultAntiSpamConfig()
 	}
 
 	cm := &CommentManager{
@@ -56,7 +68,9 @@ func NewCommentManager(client *github.Client, db *sqlx.DB, config *AntiSpamConfi
 		config:     config,
 	}
 
-	cm.initTables()
+	if err := cm.initTables(); err != nil {
+		log.Printf("Warning: failed to initialize comment tables: %v", err)
+	}
 
 	return cm
 }
