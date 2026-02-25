@@ -134,6 +134,62 @@ func (a *IssueAnalyzer) hasTriageLabel(labels []string) bool {
 	return false
 }
 
+func (a *IssueAnalyzer) hasConfirmedLabel(labels []string) bool {
+	confirmedLabels := []string{
+		"confirmed", "triage/accepted", "triage accepted", "accepted",
+		"status/confirmed", "status/accepted", "lifecycle/confirmed",
+	}
+	for _, label := range labels {
+		for _, confirmedLabel := range confirmedLabels {
+			if strings.Contains(strings.ToLower(label), strings.ToLower(confirmedLabel)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (a *IssueAnalyzer) hasGoodFirstIssueLabel(labels []string) bool {
+	goodFirstLabels := []string{
+		"good first issue", "good-first-issue", "good first issue",
+		"first timers only", "first-timers-only", "beginner friendly",
+	}
+	for _, label := range labels {
+		for _, gfiLabel := range goodFirstLabels {
+			if strings.Contains(strings.ToLower(label), strings.ToLower(gfiLabel)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type IssueFilterCriteria struct {
+	HasGoodFirstIssue bool
+	HasConfirmed      bool
+	HasAssignee       bool
+	HasPR             bool
+	IsOpen            bool
+}
+
+func (a *IssueAnalyzer) CheckFilterCriteria(labels []string, assignees []*github.User, state string, hasPR bool) IssueFilterCriteria {
+	return IssueFilterCriteria{
+		HasGoodFirstIssue: a.hasGoodFirstIssueLabel(labels),
+		HasConfirmed:      a.hasConfirmedLabel(labels),
+		HasAssignee:       len(assignees) > 0,
+		HasPR:             hasPR,
+		IsOpen:            state == "open",
+	}
+}
+
+func (a *IssueAnalyzer) MeetsAssignmentCriteria(criteria IssueFilterCriteria) bool {
+	return criteria.HasGoodFirstIssue &&
+		criteria.HasConfirmed &&
+		!criteria.HasAssignee &&
+		!criteria.HasPR &&
+		criteria.IsOpen
+}
+
 func (a *IssueAnalyzer) hasUserCommented(ctx context.Context, owner, repo string, number int) (bool, error) {
 	comments, _, err := a.client.Issues.ListComments(ctx, owner, repo, number, nil)
 	if err != nil {

@@ -1,0 +1,124 @@
+auto_finder:
+  enabled: true
+  auto_comment: true
+  max_comments_per_day: 3
+  max_comments_per_repo: 1
+  min_score_to_comment: 0.75
+  min_hours_between_comments: 2
+
+monitor:
+  enabled: true
+  check_interval: 1h
+  
+  notifications:
+    local: true
+    email: true
+    telegram: false
+    
+  filters:
+    min_score: 0.75
+    max_per_check: 5
+    
+  email:
+    smtp_host: smtp.gmail.com
+    smtp_port: 587
+    from: your@email.com
+    to: your@email.com
+
+smart_limits:
+  max_per_repo_per_day: 1
+  base_daily_limit: 3
+  max_daily_limit: 7
+  max_weekly_limit: 15
+  quality_threshold: 0.85
+  min_score_to_comment: 0.70
+
+repos:
+  included:
+    - owner: kubernetes-sigs
+      name: kubespray
+      category: kubernetes
+      priority: 1
+    - owner: cilium
+      name: cilium
+      category: networking
+      priority: 1
+    - owner: kyverno
+      name: kyverno
+      category: security
+      priority: 1
+    - owner: kubernetes
+      name: kubernetes
+      category: kubernetes
+      priority: 2
+    - owner: prometheus
+      name: prometheus
+      category: monitoring
+      priority: 2
+    - owner: etcd-io
+      name: etcd
+      category: storage
+      priority: 2
+    - owner: argoproj
+      name: argo-cd
+      category: ci-cd
+      priority: 2
+    - owner: helm
+      name: helm
+      category: kubernetes
+      priority: 2
+  
+  excluded_patterns:
+    - "aws/*"
+    - "GoogleCloudPlatform/*"
+    - "Azure/*"
+    - "googleapis/*"
+
+scoring:
+  stars_weight: 0.15
+  bug_severity_weight: 0.15
+  maintainer_confirmed_weight: 0.20
+  no_assignee_weight: 0.15
+  no_pr_weight: 0.10
+  clear_description_weight: 0.10
+  recent_activity_weight: 0.05
+  good_first_issue_bonus: 0.25
+  help_wanted_bonus: 0.20
+  cloud_provider_penalty: -0.50
+
+notifications:
+  email: true
+  local: true
+  telegram: false
+  max_per_hour: 5
+  max_per_day: 20
+
+database:
+  use_db: true
+  fallback_to_file: true
+  file_path: ~/.github-issue-finder
+
+mcp:
+  server:
+    enabled: true
+    transport: stdio  # stdio, http, sse
+    http_port: 8080
+    http_host: "localhost"
+    
+  client:
+    enabled: false
+    servers:
+      - name: "claude"
+        command: "claude-mcp-server"
+        args: []
+        env: {}
+      - name: "openai"
+        endpoint: "http://localhost:3000/mcp"
+        api_key: "${OPENAI_API_KEY}"
+    
+  ai_enhancement:
+    enabled: true
+    enhance_comments: true
+    suggest_solutions: true
+    analyze_difficulty: true
+    provider: "claude"  # claude, openai, local

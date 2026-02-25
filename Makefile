@@ -1,4 +1,4 @@
-.PHONY: build run test test-coverage clean docker-build docker-run lint fmt
+.PHONY: build run test test-coverage clean docker-build docker-run lint fmt email-test digest
 
 APP_NAME := github-issue-finder
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -14,6 +14,18 @@ build:
 
 run:
 	go run .
+
+run-find:
+	go run . find
+
+run-good-first:
+	go run . good-first
+
+run-actionable:
+	go run . actionable
+
+run-confirmed:
+	go run . confirmed
 
 test:
 	go test -v -race ./...
@@ -84,6 +96,18 @@ db-stats:
 comment-stats:
 	docker exec issue-finder-postgres psql -U postgres -d issue_finder -c "SELECT project_name, COUNT(*) as comments, MAX(commented_at) as last_comment FROM comment_history GROUP BY project_name ORDER BY comments DESC;"
 
+email-test:
+	@echo "Testing email configuration..."
+	go run . email-test
+
+digest:
+	@echo "Sending daily digest..."
+	go run . digest
+
+digest-send:
+	@echo "Sending email digest..."
+	go run . digest --send-email
+
 scheduled-push:
 	./scripts/scheduled_push.sh
 
@@ -97,6 +121,10 @@ help:
 	@echo "Available targets:"
 	@echo "  build           - Build the application"
 	@echo "  run             - Run the application"
+	@echo "  run-find        - Run and find new issues"
+	@echo "  run-good-first  - Run and find good first issues"
+	@echo "  run-actionable  - Run and find actionable issues"
+	@echo "  run-confirmed   - Run and find confirmed good first issues"
 	@echo "  test            - Run tests"
 	@echo "  test-coverage   - Run tests with coverage report"
 	@echo "  benchmark       - Run benchmarks"
@@ -108,5 +136,20 @@ help:
 	@echo "  db-reset        - Reset database tables"
 	@echo "  db-stats        - Show database statistics"
 	@echo "  comment-stats   - Show comment statistics"
+	@echo "  email-test      - Test email sending"
+	@echo "  digest          - Show daily digest"
+	@echo "  digest-send     - Send email digest"
 	@echo "  check           - Run fmt, vet, lint, test"
 	@echo "  version         - Show version info"
+	@echo ""
+	@echo "CLI Commands:"
+	@echo "  ./bin/$(APP_NAME) find              - Find new issues"
+	@echo "  ./bin/$(APP_NAME) good-first        - Find good first issues"
+	@echo "  ./bin/$(APP_NAME) actionable        - Find actionable issues"
+	@echo "  ./bin/$(APP_NAME) confirmed         - Find confirmed good first issues"
+	@echo "  ./bin/$(APP_NAME) track --url URL   - Track an issue"
+	@echo "  ./bin/$(APP_NAME) list --all        - List tracked issues"
+	@echo "  ./bin/$(APP_NAME) update --url URL --status STATUS - Update issue status"
+	@echo "  ./bin/$(APP_NAME) stats             - Show statistics"
+	@echo "  ./bin/$(APP_NAME) digest            - Show daily digest"
+	@echo "  ./bin/$(APP_NAME) email-test        - Test email configuration"

@@ -3,25 +3,15 @@ package main
 import (
 	"fmt"
 	"log"
-	"net"
-	"net/smtp"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 )
 
-type EmailConfig struct {
-	SMTPHost     string
-	SMTPPort     string
-	SMTPUsername string
-	SMTPPassword string
-	FromEmail    string
-	ToEmail      string
-}
-
 type LocalNotifier struct {
 	emailConfig       *EmailConfig
+	emailSender       *EmailSender
 	logFile           *os.File
 	notificationsFile *os.File
 }
@@ -56,6 +46,15 @@ func NewLocalNotifier(emailConfig *EmailConfig) (*LocalNotifier, error) {
 		return nil, fmt.Errorf("failed to open notifications file: %w", err)
 	}
 	notifier.notificationsFile = notificationsFile
+
+	if emailConfig != nil && emailConfig.SMTPHost != "" {
+		notifier.emailSender = NewEmailSender(emailConfig, emailConfig.MaxPerHour, emailConfig.MaxPerDay)
+		if err := notifier.emailSender.VerifyConfig(); err != nil {
+			log.Printf("[Notifier] Email verification failed: %v", err)
+		} else {
+			log.Printf("[Notifier] Email configured successfully for %s", emailConfig.ToEmail)
+		}
+	}
 
 	return notifier, nil
 }
@@ -105,7 +104,12 @@ func (n *LocalNotifier) SendIssuesAlert(issues []Issue) error {
 		n.logToNotificationsFile(issue.Title, issue.URL, issue.Score, priority)
 	}
 
-	if n.emailConfig != nil && n.emailConfig.SMTPHost != "" {
+	if n.emailSender != nil && n.emailConfig != nil {
+		if n.emailConfig.Mode == "digest" {
+			log.Printf("[Notifier] Digest mode enabled - skipping instant email")
+			return nil
+		}
+
 		if err := n.sendEmailAlert(issues); err != nil {
 			n.logToFile(fmt.Sprintf("Failed to send email: %v", err))
 			log.Printf("[Notifier] Failed to send email: %v", err)
@@ -141,82 +145,88 @@ func (n *LocalNotifier) sendEmailAlert(issues []Issue) error {
 		return nil
 	}
 
-	var body strings.Builder
-	body.WriteString("Subject: New GitHub Issues Found\n\n")
-	body.WriteString(fmt.Sprintf("Found %d new issues in Go DevOps projects:\n\n", len(issues)))
-
-	for i, issue := range issues {
-		if i >= 20 {
-			body.WriteString(fmt.Sprintf("\n... and %d more issues\n", len(issues)-20))
-			break
+	for _, issue := range issues {
+		breakdown := &ScoreBreakdown{
+			TotalScore: issue.Score,
 		}
 
-		priority := "Medium"
-		if issue.Score >= 0.8 {
-			priority = "High"
-		} else if issue.Score < 0.6 {
-			priority = "Low"
+		if err := n.emailSender.SendNewIssueEmail(issue, breakdown); err != nil {
+			log.Printf("[Notifier] Failed to send email for issue %s: %v", issue.URL, err)
+			continue
 		}
 
-		body.WriteString(fmt.Sprintf("%d. [%s] %s\n", i+1, priority, issue.Title))
-		body.WriteString(fmt.Sprintf("   Project: %s/%s (%d stars)\n", issue.Project.Org, issue.Project.Name, issue.Project.Stars))
-		body.WriteString(fmt.Sprintf("   Category: %s\n", issue.Project.Category))
-		body.WriteString(fmt.Sprintf("   Score: %.2f | Comments: %d\n", issue.Score, issue.Comments))
-		body.WriteString(fmt.Sprintf("   URL: %s\n", issue.URL))
-		if len(issue.Labels) > 0 {
-			body.WriteString(fmt.Sprintf("   Labels: %s\n", strings.Join(issue.Labels, ", ")))
-		}
-		body.WriteString("\n")
+		n.logToFile(fmt.Sprintf("Email sent for issue: %s", issue.URL))
 	}
 
-	body.WriteString("\n---\n")
-	body.WriteString("Scoring breakdown:\n")
-	body.WriteString("- Stars: Project popularity\n")
-	body.WriteString("- Comments: Low is better (less competition)\n")
-	body.WriteString("- Recency: Recent issues get higher scores\n")
-	body.WriteString("- Labels: Good first issue, help wanted, bug, enhancement help\n")
-	body.WriteString("- Difficulty: Simpler issues get higher scores\n")
-
-	if n.emailConfig.SMTPUsername == "" || n.emailConfig.SMTPPassword == "" ||
-		n.emailConfig.FromEmail == "" || n.emailConfig.ToEmail == "" {
-		return fmt.Errorf("incomplete SMTP configuration")
-	}
-
-	host := strings.TrimSpace(n.emailConfig.SMTPHost)
-	port := strings.TrimSpace(n.emailConfig.SMTPPort)
-
-	if host == "" {
-		return fmt.Errorf("smtp host is not configured")
-	}
-
-	if strings.Contains(host, ":") {
-		cleanHost, existingPort, err := net.SplitHostPort(host)
-		if err != nil {
-			return fmt.Errorf("invalid SMTP host %q: %w", host, err)
-		}
-		host = cleanHost
-		if port == "" {
-			port = existingPort
-		}
-	}
-
-	if port == "" {
-		port = "587"
-	}
-
-	auth := smtp.PlainAuth("", n.emailConfig.SMTPUsername, n.emailConfig.SMTPPassword, host)
-
-	to := []string{n.emailConfig.ToEmail}
-	msg := []byte(body.String())
-
-	addr := net.JoinHostPort(host, port)
-	if err := smtp.SendMail(addr, auth, n.emailConfig.FromEmail, to, msg); err != nil {
-		return fmt.Errorf("failed to send email: %w", err)
-	}
-
-	n.logToFile("Email sent successfully")
-	log.Printf("[Notifier] Email alert sent to %s via %s", n.emailConfig.ToEmail, addr)
 	return nil
+}
+
+func (n *LocalNotifier) SendDigestEmail(issues []Issue) error {
+	if n.emailSender == nil {
+		return fmt.Errorf("email sender not configured")
+	}
+
+	if len(issues) == 0 {
+		log.Printf("[Notifier] No issues for digest")
+		return nil
+	}
+
+	if err := n.emailSender.SendDigestEmail(issues); err != nil {
+		return fmt.Errorf("failed to send digest email: %w", err)
+	}
+
+	n.logToFile(fmt.Sprintf("Digest email sent with %d issues", len(issues)))
+	log.Printf("[Notifier] Digest email sent to %s", n.emailConfig.ToEmail)
+	return nil
+}
+
+func (n *LocalNotifier) SendAssignmentConfirmation(issue Issue) error {
+	if n.emailSender == nil {
+		return nil
+	}
+
+	if err := n.emailSender.SendAssignmentConfirmationEmail(issue); err != nil {
+		return fmt.Errorf("failed to send assignment confirmation: %w", err)
+	}
+
+	n.logToFile(fmt.Sprintf("Assignment confirmation sent for: %s", issue.URL))
+	return nil
+}
+
+func (n *LocalNotifier) SendAssignmentRequest(issue Issue) error {
+	if n.emailSender == nil {
+		return nil
+	}
+
+	if err := n.emailSender.SendAssignmentRequestEmail(issue); err != nil {
+		return fmt.Errorf("failed to send assignment request notification: %w", err)
+	}
+
+	n.logToFile(fmt.Sprintf("Assignment request notification sent for: %s", issue.URL))
+	return nil
+}
+
+func (n *LocalNotifier) TestEmail() error {
+	if n.emailSender == nil {
+		return fmt.Errorf("email sender not configured")
+	}
+
+	testIssue := Issue{
+		Title:     "Test Issue - Email Configuration Working",
+		URL:       "https://github.com/test/test/issues/1",
+		Score:     0.85,
+		CreatedAt: time.Now(),
+		Comments:  2,
+		Labels:    []string{"good first issue", "help wanted"},
+		Project: Project{
+			Org:      "test",
+			Name:     "test-repo",
+			Category: "Test",
+			Stars:    1000,
+		},
+	}
+
+	return n.emailSender.SendNewIssueEmail(testIssue, &ScoreBreakdown{TotalScore: 0.85})
 }
 
 func (n *LocalNotifier) LogError(message string) {
@@ -227,4 +237,44 @@ func (n *LocalNotifier) LogError(message string) {
 func (n *LocalNotifier) LogInfo(message string) {
 	log.Printf("INFO: %s", message)
 	n.logToFile(fmt.Sprintf("INFO: %s", message))
+}
+
+func (n *LocalNotifier) GetEmailStats() map[string]interface{} {
+	if n.emailSender == nil {
+		return map[string]interface{}{
+			"enabled": false,
+		}
+	}
+	return n.emailSender.GetStats()
+}
+
+func (n *LocalNotifier) SendQualifiedIssueEmail(issue QualifiedIssue) error {
+	if n.emailSender == nil {
+		return fmt.Errorf("email sender not configured")
+	}
+
+	canSend, reason := n.emailSender.CanSend(EmailTypeNewIssue, issue.URL)
+	if !canSend {
+		return fmt.Errorf("cannot send: %s", reason)
+	}
+
+	template := QualifiedIssueEmailTemplate(issue)
+	err := n.emailSender.SendEmail(template.Subject, template.HTMLBody, template.TextBody)
+	if err != nil {
+		return err
+	}
+
+	n.emailSender.RecordSent(EmailTypeNewIssue, issue.URL)
+	n.logToFile(fmt.Sprintf("Qualified issue email sent: %s", issue.URL))
+	return nil
+}
+
+func (n *LocalNotifier) SendDesktopNotification(issue QualifiedIssue) error {
+	title := fmt.Sprintf("🎯 Qualified Issue: %s", issue.Project.Name)
+	message := fmt.Sprintf("%s\nScore: %.2f | %s", issue.Title, issue.QualifiedScore.TotalScore, issue.Type)
+
+	n.logToNotificationsFile(issue.Title, issue.URL, issue.QualifiedScore.TotalScore, "Desktop")
+
+	_, err := fmt.Printf("\n🔔 DESKTOP NOTIFICATION\n%s\n%s\n", title, message)
+	return err
 }

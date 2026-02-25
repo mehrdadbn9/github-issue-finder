@@ -270,6 +270,8 @@ func (s *IssueScorer) ScoreIssue(issue *github.Issue, project Project) float64 {
 		"helm", "dapr", "keda", "argo", "rancher", "velero", "traefik", "flux",
 		"knative", "opa", "cni", "cri-o", "runc", "coredns", "envoy", "linkerd",
 		"crossplane", "keptn", "openfeature", "backstage", "dragonfly", "vineyard",
+		"kubespray", "kubeadm", "minikube", "kind", "calico", "flannel", "rook",
+		"longhorn", "openebs", "ceph", "minio", "kuma", "thanos", "victoriametrics",
 	}
 	if slices.ContainsFunc(cncfProjects, func(p string) bool {
 		return strings.Contains(strings.ToLower(project.Name), p)
@@ -392,6 +394,40 @@ func hasAnyLabel(labels []*github.Label, targets ...string) bool {
 	})
 }
 
+func hasConfirmedLabel(labels []*github.Label) bool {
+	confirmedLabels := []string{"confirmed", "triage/accepted", "triage accepted", "accepted", "status/confirmed", "status/accepted", "lifecycle/confirmed"}
+	for _, label := range labels {
+		labelName := strings.ToLower(label.GetName())
+		for _, confirmedLabel := range confirmedLabels {
+			if strings.Contains(labelName, strings.ToLower(confirmedLabel)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func hasGoodFirstIssueLabel(labels []*github.Label) bool {
+	goodFirstLabels := []string{"good first issue", "good-first-issue", "first timers only", "first-timers-only", "beginner friendly"}
+	for _, label := range labels {
+		labelName := strings.ToLower(label.GetName())
+		for _, gfiLabel := range goodFirstLabels {
+			if strings.Contains(labelName, strings.ToLower(gfiLabel)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func convertLabels(labelNames []string) []*github.Label {
+	labels := make([]*github.Label, len(labelNames))
+	for i, name := range labelNames {
+		labels[i] = &github.Label{Name: github.String(name)}
+	}
+	return labels
+}
+
 func containsAny(text string, keywords []string) bool {
 	return slices.ContainsFunc(keywords, func(kw string) bool {
 		return strings.Contains(text, kw)
@@ -507,16 +543,23 @@ func (s *IssueScorer) normalizeDifficulty(labels []*github.Label, body string) f
 }
 
 type IssueFinder struct {
-	config      *Config
-	client      *github.Client
-	rateLimiter *RateLimiter
-	bot         *tgbotapi.BotAPI
-	notifier    *LocalNotifier
-	db          *sqlx.DB
-	scorer      *IssueScorer
-	projects    []Project
-	seenIssues  map[string]bool
-	mu          sync.RWMutex
+	config        *Config
+	client        *github.Client
+	rateLimiter   *RateLimiter
+	bot           *tgbotapi.BotAPI
+	notifier      *LocalNotifier
+	db            *sqlx.DB
+	scorer        *IssueScorer
+	projects      []Project
+	seenIssues    map[string]bool
+	tracker       *IssueTracker
+	assignmentMgr *AssignmentManager
+	antiSpam      *NotificationSpamManager
+	autoFinder    *AutoFinder
+	repoManager   *RepoManager
+	fileStore     *FileStorage
+	monitor       *IssueMonitor
+	mu            sync.RWMutex
 }
 
 func NewIssueFinder(config *Config, notifier *LocalNotifier) (*IssueFinder, error) {
@@ -566,6 +609,62 @@ func NewIssueFinder(config *Config, notifier *LocalNotifier) (*IssueFinder, erro
 
 	if err := finder.loadSeenIssues(); err != nil {
 		log.Printf("Warning: failed to load seen issues: %v", err)
+	}
+
+	tracker, err := NewIssueTracker(db.DB)
+	if err != nil {
+		log.Printf("Warning: failed to create issue tracker: %v", err)
+	} else {
+		finder.tracker = tracker
+	}
+
+	antiSpamManager, err := NewNotificationSpamManager(*config.AntiSpam, db.DB)
+	if err != nil {
+		log.Printf("Warning: failed to create anti-spam manager: %v", err)
+	} else {
+		finder.antiSpam = antiSpamManager
+	}
+
+	if config.Assignment != nil && config.Assignment.Enabled {
+		username := ""
+		user, _, err := client.Users.Get(ctx, "")
+		if err == nil && user != nil {
+			username = user.GetLogin()
+		}
+		assignmentMgr, err := NewAssignmentManager(client, db.DB, username, true, config.Assignment.AutoMode)
+		if err != nil {
+			log.Printf("Warning: failed to create assignment manager: %v", err)
+		} else {
+			finder.assignmentMgr = assignmentMgr
+			log.Printf("Assignment manager enabled (auto: %v)", config.Assignment.AutoMode)
+		}
+	}
+
+	finder.repoManager = NewRepoManager()
+
+	fileStore, err := NewFileStorage("")
+	if err != nil {
+		log.Printf("Warning: failed to create file storage: %v", err)
+	} else {
+		finder.fileStore = fileStore
+	}
+
+	autoFinderConfig := LoadAutoFinderConfigFromEnv()
+	autoFinder, err := NewAutoFinder(autoFinderConfig, db, client, antiSpamManager)
+	if err != nil {
+		log.Printf("Warning: failed to create auto finder: %v", err)
+	} else {
+		finder.autoFinder = autoFinder
+		log.Printf("Auto finder initialized (enabled: %v)", autoFinderConfig.Enabled)
+	}
+
+	monitorConfig := DefaultMonitorConfig()
+	monitor, err := NewIssueMonitor(monitorConfig, client, notifier, fileStore)
+	if err != nil {
+		log.Printf("Warning: failed to create issue monitor: %v", err)
+	} else {
+		finder.monitor = monitor
+		log.Printf("Issue monitor initialized (enabled: %v)", monitorConfig.Enabled)
 	}
 
 	finder.initializeProjects()
@@ -738,9 +837,7 @@ func (f *IssueFinder) initializeProjects() {
 		{Org: "prometheus", Name: "mysqld_exporter", Category: "Monitoring", Stars: 2000},
 		{Org: "nginxinc", Name: "nginx-prometheus-exporter", Category: "Monitoring", Stars: 1500},
 		{Org: "prometheus", Name: "haproxy_exporter", Category: "Monitoring", Stars: 1000},
-		{Org: "prometheus", Name: "aws_cloudwatch_exporter", Category: "Monitoring", Stars: 400},
-		{Org: "prometheus-community", Name: "stackdriver_exporter", Category: "Monitoring", Stars: 300},
-		{Org: "prometheus-community", Name: "azure_exporter", Category: "Monitoring", Stars: 300},
+
 		{Org: "prometheus", Name: "consul_exporter", Category: "Monitoring", Stars: 400},
 		{Org: "prometheus", Name: "etcd_exporter", Category: "Monitoring", Stars: 200},
 		{Org: "dabealu", Name: "zookeeper_exporter", Category: "Monitoring", Stars: 200},
@@ -1011,6 +1108,36 @@ func (f *IssueFinder) initializeProjects() {
 		{Org: "blevesearch", Name: "bleve", Category: "Go Tools", Stars: 11000},
 		{Org: "machadovilaca", Name: "operator-builder", Category: "Kubernetes", Stars: 200},
 		{Org: "operator-framework", Name: "operator-lifecycle-manager", Category: "Kubernetes", Stars: 3000},
+
+		// Kubernetes Baremetal / On-Premise
+		{Org: "kubernetes-sigs", Name: "kubespray", Category: "Baremetal", Stars: 16000},
+		{Org: "kubernetes", Name: "minikube", Category: "Baremetal", Stars: 29000},
+		{Org: "kubernetes-sigs", Name: "kubeadm", Category: "Baremetal", Stars: 7000},
+
+		// Networking / CNI
+		{Org: "projectcalico", Name: "calico", Category: "Networking", Stars: 6000},
+		{Org: "flannel-io", Name: "flannel", Category: "Networking", Stars: 9000},
+		{Org: "kube-router", Name: "kube-router", Category: "Networking", Stars: 2000},
+		{Org: "kubernetes-sigs", Name: "gateway-api", Category: "Networking", Stars: 2000},
+
+		// Container Runtime
+		{Org: "opencontainers", Name: "runc", Category: "Container Runtime", Stars: 12000},
+
+		// Service Mesh
+		{Org: "kumahq", Name: "kuma", Category: "Service Mesh", Stars: 6000},
+
+		// Storage
+		{Org: "openebs", Name: "openebs", Category: "Storage", Stars: 8000},
+		{Org: "rancher", Name: "local-path-provisioner", Category: "Storage", Stars: 2000},
+		{Org: "ceph", Name: "ceph", Category: "Storage", Stars: 4000},
+
+		// Infrastructure
+		{Org: "hashicorp", Name: "packer", Category: "Infrastructure", Stars: 15000},
+		{Org: "hashicorp", Name: "vagrant", Category: "Infrastructure", Stars: 26000},
+
+		// Backup
+		{Org: "restic", Name: "restic", Category: "Backup", Stars: 26000},
+		{Org: "kopia", Name: "kopia", Category: "Backup", Stars: 8000},
 	}
 
 	sort.Slice(f.projects, func(i, j int) bool {
@@ -1937,6 +2064,305 @@ func PrintGoUpgradeIssues(issues []Issue) {
 	}
 }
 
+type ConfirmedGoodFirstIssue struct {
+	Issue
+	HasConfirmedLabel bool
+	HasGoodFirstLabel bool
+	HasLinkedPR       bool
+	HasAssignee       bool
+	IsEligible        bool
+}
+
+func (f *IssueFinder) FindConfirmedGoodFirstIssues(ctx context.Context, targetRepo string) ([]ConfirmedGoodFirstIssue, error) {
+	var allIssues []ConfirmedGoodFirstIssue
+	var mu sync.Mutex
+
+	targetProjects := f.projects
+	if targetRepo != "" {
+		parts := strings.Split(targetRepo, "/")
+		if len(parts) == 2 {
+			targetProjects = []Project{}
+			for _, p := range f.projects {
+				if p.Org == parts[0] && p.Name == parts[1] {
+					targetProjects = append(targetProjects, p)
+					break
+				}
+			}
+			if len(targetProjects) == 0 {
+				targetProjects = []Project{{Org: parts[0], Name: parts[1], Category: "Unknown", Stars: 0}}
+			}
+		}
+	}
+
+	log.Printf("[Confirmed GFI] Checking %d projects for good first issue + confirmed labels", len(targetProjects))
+
+	batchSize := 10
+	for i := 0; i < len(targetProjects); i += batchSize {
+		end := i + batchSize
+		if end > len(targetProjects) {
+			end = len(targetProjects)
+		}
+
+		var projectWg sync.WaitGroup
+
+		for j := i; j < end; j++ {
+			project := targetProjects[j]
+			projectWg.Add(1)
+			go func(p Project) {
+				defer projectWg.Done()
+
+				var issues []*github.Issue
+				var err error
+
+				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch confirmed GFI for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+					opts := &github.IssueListByRepoOptions{
+						State:     "open",
+						Sort:      "created",
+						Direction: "desc",
+						Labels:    []string{"good first issue"},
+						ListOptions: github.ListOptions{
+							PerPage: 50,
+						},
+					}
+
+					var apiErr error
+					issues, _, apiErr = f.client.Issues.ListByRepo(ctx, p.Org, p.Name, opts)
+					return nil, apiErr
+				})
+
+				if err != nil {
+					log.Printf("Error fetching issues for %s/%s: %v", p.Org, p.Name, err)
+					return
+				}
+
+				for _, issue := range issues {
+					if issue.IsPullRequest() {
+						continue
+					}
+
+					if issue.GetState() != "open" {
+						continue
+					}
+
+					labels := make([]string, 0, len(issue.Labels))
+					hasGoodFirst := hasGoodFirstIssueLabel(issue.Labels)
+					hasConfirmed := hasConfirmedLabel(issue.Labels)
+
+					for _, label := range issue.Labels {
+						labels = append(labels, label.GetName())
+					}
+
+					hasAssignee := len(issue.Assignees) > 0
+					hasPR := issue.PullRequestLinks != nil
+
+					if !hasGoodFirst || !hasConfirmed {
+						continue
+					}
+
+					if !hasPR {
+						query := fmt.Sprintf("repo:%s/%s is:pr %d in:body", p.Org, p.Name, issue.GetNumber())
+						result, _, err := f.client.Search.Issues(ctx, query, nil)
+						if err == nil && result != nil {
+							hasPR = *result.Total > 0
+						}
+					}
+
+					isEligible := !hasAssignee && !hasPR
+
+					score := f.scorer.ScoreIssue(issue, p) + 0.35
+					if hasConfirmed {
+						score += 0.25
+					}
+					if !hasAssignee {
+						score += 0.15
+					}
+					if !hasPR {
+						score += 0.10
+					}
+
+					age := time.Since(issue.CreatedAt.Time).Hours()
+					if age > 168 && age < 2160 && *issue.Comments <= 3 {
+						score += 0.10
+					}
+
+					if score > 1.5 {
+						score = 1.5
+					}
+
+					confirmedIssue := ConfirmedGoodFirstIssue{
+						Issue: Issue{
+							Project:     p,
+							Title:       issue.GetTitle(),
+							URL:         issue.GetHTMLURL(),
+							Number:      issue.GetNumber(),
+							Score:       score,
+							CreatedAt:   issue.GetCreatedAt().Time,
+							Comments:    issue.GetComments(),
+							Labels:      labels,
+							Language:    "Go",
+							IsGoodFirst: hasGoodFirst,
+						},
+						HasConfirmedLabel: hasConfirmed,
+						HasGoodFirstLabel: hasGoodFirst,
+						HasLinkedPR:       hasPR,
+						HasAssignee:       hasAssignee,
+						IsEligible:        isEligible,
+					}
+
+					mu.Lock()
+					allIssues = append(allIssues, confirmedIssue)
+					mu.Unlock()
+				}
+			}(project)
+		}
+
+		projectWg.Wait()
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	sort.Slice(allIssues, func(i, j int) bool {
+		if allIssues[i].IsEligible != allIssues[j].IsEligible {
+			return allIssues[i].IsEligible
+		}
+		return allIssues[i].Score > allIssues[j].Score
+	})
+
+	log.Printf("[Confirmed GFI] Found %d issues (eligible: %d)", len(allIssues), countEligible(allIssues))
+	return allIssues, nil
+}
+
+func countEligible(issues []ConfirmedGoodFirstIssue) int {
+	count := 0
+	for _, issue := range issues {
+		if issue.IsEligible {
+			count++
+		}
+	}
+	return count
+}
+
+func PrintConfirmedGoodFirstIssues(issues []ConfirmedGoodFirstIssue) {
+	fmt.Printf("\n%s\n", "GOOD FIRST ISSUES WITH CONFIRMED LABEL (Ready for Assignment)")
+	fmt.Println(strings.Repeat("=", 80))
+	fmt.Println("Criteria: good first issue + confirmed/triage/accepted, no assignee, no PR")
+	fmt.Println(strings.Repeat("-", 80))
+
+	if len(issues) == 0 {
+		fmt.Println("No matching issues found.")
+		return
+	}
+
+	var eligible []ConfirmedGoodFirstIssue
+	var ineligible []ConfirmedGoodFirstIssue
+
+	for _, issue := range issues {
+		if issue.IsEligible {
+			eligible = append(eligible, issue)
+		} else {
+			ineligible = append(ineligible, issue)
+		}
+	}
+
+	if len(eligible) > 0 {
+		fmt.Printf("\n✅ ELIGIBLE FOR ASSIGNMENT (%d issues)\n", len(eligible))
+		fmt.Println(strings.Repeat("-", 80))
+		for i, issue := range eligible {
+			if i >= 20 {
+				break
+			}
+			fmt.Printf("\n🔥 [%d] %s (Score: %.2f)\n", i+1, issue.Title, issue.Score)
+			fmt.Printf("   Project: %s/%s (%d★)\n", issue.Project.Org, issue.Project.Name, issue.Project.Stars)
+			fmt.Printf("   Comments: %d | Created: %s\n", issue.Comments, issue.CreatedAt.Format("2006-01-02"))
+			fmt.Printf("   URL: %s\n", issue.URL)
+			fmt.Printf("   Labels: %s\n", strings.Join(issue.Labels, ", "))
+			fmt.Println(strings.Repeat("-", 80))
+		}
+	}
+
+	if len(ineligible) > 0 {
+		fmt.Printf("\n\n⚠️ NOT ELIGIBLE (%d issues)\n", len(ineligible))
+		fmt.Println(strings.Repeat("-", 80))
+		for i, issue := range ineligible {
+			if i >= 10 {
+				break
+			}
+			reason := ""
+			if issue.HasAssignee {
+				reason = "has assignee"
+			} else if issue.HasLinkedPR {
+				reason = "has linked PR"
+			}
+			fmt.Printf("\n[%d] %s (%s)\n", i+1, issue.Title, reason)
+			fmt.Printf("   URL: %s\n", issue.URL)
+		}
+	}
+}
+
+func (f *IssueFinder) ProcessNewIssueNotifications(ctx context.Context, issues []ConfirmedGoodFirstIssue) ([]Issue, error) {
+	var newIssues []Issue
+
+	for _, issue := range issues {
+		if !issue.IsEligible {
+			continue
+		}
+
+		issueURL := issue.URL
+
+		if f.antiSpam != nil {
+			alreadyNotified, err := f.antiSpam.WasAlreadyNotified(issueURL)
+			if err != nil {
+				log.Printf("Warning: failed to check notification status: %v", err)
+			} else if alreadyNotified {
+				continue
+			}
+		}
+
+		if f.tracker != nil {
+			wasNotified, err := f.tracker.WasNotified(issueURL)
+			if err != nil {
+				log.Printf("Warning: failed to check tracker notification status: %v", err)
+			} else if wasNotified {
+				continue
+			}
+
+			trackedIssue := &TrackedIssue{
+				IssueURL:     issueURL,
+				IssueTitle:   issue.Title,
+				ProjectOrg:   issue.Project.Org,
+				ProjectName:  issue.Project.Name,
+				IssueNumber:  issue.Number,
+				Status:       StatusNew,
+				Score:        issue.Score,
+				Labels:       strings.Join(issue.Labels, ","),
+				HasGoodFirst: issue.HasGoodFirstLabel,
+				HasConfirmed: issue.HasConfirmedLabel,
+				HasAssignee:  issue.HasAssignee,
+				HasPR:        issue.HasLinkedPR,
+			}
+
+			if err := f.tracker.AddIssue(trackedIssue); err != nil {
+				log.Printf("Warning: failed to track issue: %v", err)
+			}
+		}
+
+		newIssues = append(newIssues, issue.Issue)
+
+		if f.antiSpam != nil {
+			if err := f.antiSpam.RecordNotification(issue.Project.Name, issueURL, issue.Number); err != nil {
+				log.Printf("Warning: failed to record notification: %v", err)
+			}
+		}
+
+		if f.tracker != nil {
+			if err := f.tracker.MarkNotified(issueURL); err != nil {
+				log.Printf("Warning: failed to mark issue as notified: %v", err)
+			}
+		}
+	}
+
+	return newIssues, nil
+}
+
 func (f *IssueFinder) SendTelegramAlert(issues []Issue) error {
 	if f.bot == nil {
 		return nil
@@ -2154,6 +2580,21 @@ func (f *IssueFinder) GetTopIssues(limit int) ([]Issue, error) {
 						WHEN project_name = 'kruise' THEN 'kruise'
 						WHEN project_name = 'kubevela' THEN 'kubevela'
 						WHEN project_name = 'oam-kubernetes-runtime' THEN 'oam-kubernetes-runtime'
+						WHEN project_name = 'kubespray' THEN 'kubespray'
+						WHEN project_name = 'minikube' THEN 'minikube'
+						WHEN project_name = 'kubeadm' THEN 'kubeadm'
+						WHEN project_name = 'calico' THEN 'calico'
+						WHEN project_name = 'flannel' THEN 'flannel'
+						WHEN project_name = 'kube-router' THEN 'kube-router'
+						WHEN project_name = 'gateway-api' THEN 'gateway-api'
+						WHEN project_name = 'openebs' THEN 'openebs'
+						WHEN project_name = 'local-path-provisioner' THEN 'local-path-provisioner'
+						WHEN project_name = 'ceph' THEN 'ceph'
+						WHEN project_name = 'kuma' THEN 'kuma'
+						WHEN project_name = 'packer' THEN 'packer'
+						WHEN project_name = 'vagrant' THEN 'vagrant'
+						WHEN project_name = 'restic' THEN 'restic'
+						WHEN project_name = 'kopia' THEN 'kopia'
 						WHEN project_name = 'dashboard' THEN 'dashboard'
 						WHEN project_name = 'kube-state-metrics' THEN 'kube-state-metrics'
 						WHEN project_name = 'node_exporter' THEN 'node_exporter'
@@ -2171,9 +2612,6 @@ func (f *IssueFinder) GetTopIssues(limit int) ([]Issue, error) {
 						WHEN project_name = 'mysqld_exporter' THEN 'mysqld_exporter'
 						WHEN project_name = 'nginx-prometheus-exporter' THEN 'nginx-prometheus-exporter'
 						WHEN project_name = 'haproxy_exporter' THEN 'haproxy_exporter'
-						WHEN project_name = 'aws_cloudwatch_exporter' THEN 'aws_cloudwatch_exporter'
-						WHEN project_name = 'stackdriver_exporter' THEN 'stackdriver_exporter'
-						WHEN project_name = 'azure_exporter' THEN 'azure_exporter'
 						WHEN project_name = 'consul_exporter' THEN 'consul_exporter'
 						WHEN project_name = 'etcd_exporter' THEN 'etcd_exporter'
 						WHEN project_name = 'zookeeper_exporter' THEN 'zookeeper_exporter'
@@ -2331,6 +2769,21 @@ func (f *IssueFinder) GetTopIssues(limit int) ([]Issue, error) {
 						WHEN project_name = 'kruise' THEN 4500
 						WHEN project_name = 'kubevela' THEN 5500
 						WHEN project_name = 'oam-kubernetes-runtime' THEN 1000
+						WHEN project_name = 'kubespray' THEN 16000
+						WHEN project_name = 'minikube' THEN 29000
+						WHEN project_name = 'kubeadm' THEN 7000
+						WHEN project_name = 'calico' THEN 6000
+						WHEN project_name = 'flannel' THEN 9000
+						WHEN project_name = 'kube-router' THEN 2000
+						WHEN project_name = 'gateway-api' THEN 2000
+						WHEN project_name = 'openebs' THEN 8000
+						WHEN project_name = 'local-path-provisioner' THEN 2000
+						WHEN project_name = 'ceph' THEN 4000
+						WHEN project_name = 'kuma' THEN 6000
+						WHEN project_name = 'packer' THEN 15000
+						WHEN project_name = 'vagrant' THEN 26000
+						WHEN project_name = 'restic' THEN 26000
+						WHEN project_name = 'kopia' THEN 8000
 						WHEN project_name = 'dashboard' THEN 13000
 						WHEN project_name = 'kube-state-metrics' THEN 5000
 						WHEN project_name = 'node_exporter' THEN 10000
@@ -2348,9 +2801,6 @@ func (f *IssueFinder) GetTopIssues(limit int) ([]Issue, error) {
 						WHEN project_name = 'mysqld_exporter' THEN 2000
 						WHEN project_name = 'nginx-prometheus-exporter' THEN 1500
 						WHEN project_name = 'haproxy_exporter' THEN 1000
-						WHEN project_name = 'aws_cloudwatch_exporter' THEN 400
-						WHEN project_name = 'stackdriver_exporter' THEN 300
-						WHEN project_name = 'azure_exporter' THEN 300
 						WHEN project_name = 'consul_exporter' THEN 400
 						WHEN project_name = 'etcd_exporter' THEN 200
 						WHEN project_name = 'zookeeper_exporter' THEN 200
@@ -2394,16 +2844,6 @@ func (f *IssueFinder) GetTopIssues(limit int) ([]Issue, error) {
 	return issues, nil
 }
 
-func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
-	}
-	if maxLen <= 3 {
-		return s[:maxLen]
-	}
-	return s[:maxLen-3] + "..."
-}
-
 func min(a, b int) int {
 	if a < b {
 		return a
@@ -2411,33 +2851,171 @@ func min(a, b int) int {
 	return b
 }
 
-func loadEmailConfigFromEnv() *EmailConfig {
-	host := strings.TrimSpace(os.Getenv("SMTP_HOST"))
-	username := strings.TrimSpace(os.Getenv("SMTP_USERNAME"))
-	password := strings.TrimSpace(os.Getenv("SMTP_PASSWORD"))
-	from := strings.TrimSpace(os.Getenv("FROM_EMAIL"))
-	to := strings.TrimSpace(os.Getenv("TO_EMAIL"))
-	port := strings.TrimSpace(os.Getenv("SMTP_PORT"))
+func runMonitorStatusOnly() error {
+	fmt.Println("\n📊 MONITOR STATUS")
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println("   Running: No active daemon")
+	fmt.Println("   Note: Use 'monitor start' to begin monitoring")
+	fmt.Println("\n📋 Default Configuration:")
+	config := DefaultMonitorConfig()
+	fmt.Printf("   Check Interval: %v\n", config.CheckInterval)
+	fmt.Printf("   Min Score: %.2f\n", config.MinScore)
+	fmt.Printf("   Max Issues Per Check: %d\n", config.MaxIssuesPerCheck)
+	fmt.Printf("   Notifications: Local=%v, Email=%v\n", config.NotifyLocal, config.NotifyEmail)
+	fmt.Printf("   Repositories: %d\n", len(config.Repos))
 
-	if host == "" || username == "" || password == "" || from == "" || to == "" {
-		return nil
+	fmt.Println("\n📁 Monitored Repositories (by category):")
+	categories := make(map[string][]RepoConfig)
+	for _, repo := range config.Repos {
+		categories[repo.Category] = append(categories[repo.Category], repo)
+	}
+	for cat, repos := range categories {
+		fmt.Printf("\n   %s (%d repos):\n", strings.Title(cat), len(repos))
+		for _, r := range repos {
+			fmt.Printf("      - %s/%s (priority: %d)\n", r.Owner, r.Name, r.Priority)
+		}
 	}
 
-	if port == "" {
-		port = "587"
-	}
-
-	return &EmailConfig{
-		SMTPHost:     host,
-		SMTPPort:     port,
-		SMTPUsername: username,
-		SMTPPassword: password,
-		FromEmail:    from,
-		ToEmail:      to,
-	}
+	return nil
 }
 
 func main() {
+	cmd, args := ParseCLIArgs()
+
+	if cmd == CmdMCP {
+		if err := runMCPCommand(args); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+		return
+	}
+
+	if cmd == CmdMCPHTTP {
+		if err := runMCPHTTPCommand(args); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+		return
+	}
+
+	if cmd == CmdMCPListTools {
+		if err := runMCPListToolsCommand(args); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+		return
+	}
+
+	if cmd == CmdMCPTest {
+		if err := runMCPTestCommand(args); err != nil {
+			log.Fatalf("Error: %v", err)
+		}
+		return
+	}
+
+	if cmd == CmdLimits {
+		if err := runLimitsCommand(nil); err != nil {
+			log.Printf("Error: %v", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if cmd == CmdMonitor {
+		if len(args) == 0 {
+			PrintMonitorUsage()
+			return
+		}
+		subCmd := args[0]
+		switch subCmd {
+		case "status":
+			runMonitorStatusOnly()
+		case "start":
+			fmt.Println("Start command requires a running service. Use 'monitor check' for one-time check.")
+		case "stop":
+			fmt.Println("Stop command requires a running service.")
+		case "check":
+			token := os.Getenv("GITHUB_TOKEN")
+			if token == "" {
+				fmt.Println("This command requires GITHUB_TOKEN to be set.")
+				fmt.Println("Set GITHUB_TOKEN and try again.")
+				return
+			}
+
+			ts := oauth2.StaticTokenSource(
+				&oauth2.Token{AccessToken: token},
+			)
+			tc := oauth2.NewClient(context.Background(), ts)
+			client := github.NewClient(tc)
+
+			storage, err := NewFileStorage("")
+			if err != nil {
+				log.Printf("Error creating storage: %v", err)
+				os.Exit(1)
+			}
+
+			monitorConfig := &MonitorConfig{
+				Repos:             DefaultMonitorRepos,
+				CheckInterval:     time.Hour,
+				MinScore:          0.50,
+				MaxIssuesPerCheck: 5,
+				NotifyLocal:       true,
+				NotifyEmail:       false,
+			}
+
+			monitor, err := NewIssueMonitor(monitorConfig, client, nil, storage)
+			if err != nil {
+				log.Printf("Error creating monitor: %v", err)
+				os.Exit(1)
+			}
+
+			issues, err := monitor.CheckOnce(context.Background())
+			if err != nil {
+				log.Printf("Error: %v", err)
+				os.Exit(1)
+			}
+
+			if len(issues) == 0 {
+				fmt.Println("No new issues found matching criteria.")
+			} else {
+				fmt.Printf("\nFound %d new issues!\n\n", len(issues))
+				for i, issue := range issues {
+					fmt.Printf("%d. [%s] #%d - %s\n", i+1, issue.Repo, issue.IssueNumber, issue.Title)
+					fmt.Printf("   Score: %.2f | %s\n\n", issue.Score, issue.URL)
+				}
+
+				monitor.NotifyLocal(issues)
+			}
+
+		case "notify":
+			testIssues := []FoundIssue{
+				{Repo: "test/repo", IssueNumber: 123, Title: "Test Issue", Score: 0.85, URL: "https://github.com/test/repo/issues/123"},
+			}
+			storage, err := NewFileStorage("")
+			if err != nil {
+				log.Printf("Error creating storage: %v", err)
+				return
+			}
+			token := os.Getenv("GITHUB_TOKEN")
+			if token == "" {
+				token = "dummy"
+			}
+			ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: token})
+			tc := oauth2.NewClient(context.Background(), ts)
+			client := github.NewClient(tc)
+
+			config := &MonitorConfig{NotifyLocal: true}
+			monitor, err := NewIssueMonitor(config, client, nil, storage)
+			if err != nil {
+				log.Printf("Error creating monitor: %v", err)
+				return
+			}
+			monitor.NotifyLocal(testIssues)
+			fmt.Println("Test notification sent!")
+		default:
+			fmt.Printf("Unknown monitor subcommand: %s\n", subCmd)
+			PrintMonitorUsage()
+		}
+		return
+	}
+
 	chatID := int64(683539779)
 	if chatEnv := os.Getenv("TELEGRAM_CHAT_ID"); chatEnv != "" {
 		parsed, err := strconv.ParseInt(chatEnv, 10, 64)
@@ -2505,7 +3083,7 @@ func main() {
 
 	finder, err := NewIssueFinder(config, notifier)
 	if err != nil {
-		log.Printf("Failed to create IssueFinder: %v", err)
+		log.Fatalf("Failed to create IssueFinder: %v", err)
 	}
 	defer finder.db.Close()
 
@@ -2606,13 +3184,73 @@ func main() {
 			log.Printf("Error finding actionable issues: %v", err)
 			return
 		}
-		PrintActionableIssues(actionableIssues)
+
+		goodFirstIssues := []Issue{}
+		otherIssues := []Issue{}
+		for _, issue := range actionableIssues {
+			if issue.IsGoodFirst {
+				goodFirstIssues = append(goodFirstIssues, issue)
+			} else {
+				otherIssues = append(otherIssues, issue)
+			}
+		}
+		DisplayPartitionedIssues(goodFirstIssues, otherIssues, []Issue{})
+
 		if notifier != nil {
 			notifier.logToFile(fmt.Sprintf("Found %d actionable issues", len(actionableIssues)))
 			for _, issue := range actionableIssues {
 				notifier.logToNotificationsFile(issue.Title, issue.URL, issue.Score, "Actionable")
 			}
 		}
+		return
+	}
+
+	if mode == "partitioned" {
+		log.Printf("\n=== FINDING ISSUES WITH PARTITIONED DISPLAY ===")
+		if err := finder.rateLimiter.checkRateLimit(ctx); err != nil {
+			log.Printf("Warning: failed to check rate limit: %v", err)
+		}
+
+		allIssues, err := finder.FindActionableIssues(ctx)
+		if err != nil {
+			log.Printf("Error finding issues: %v", err)
+			return
+		}
+
+		goodFirstIssues := []Issue{}
+		otherIssues := []Issue{}
+		for _, issue := range allIssues {
+			if issue.IsGoodFirst {
+				goodFirstIssues = append(goodFirstIssues, issue)
+			} else {
+				otherIssues = append(otherIssues, issue)
+			}
+		}
+
+		assignedIssues := []Issue{}
+		assignedIssuesResp, _, err := finder.client.Search.Issues(ctx, "assignee:mehrdadbn9 state:open", nil)
+		if err == nil && assignedIssuesResp != nil {
+			for _, ghIssue := range assignedIssuesResp.Issues {
+				issue := Issue{
+					Title:     *ghIssue.Title,
+					URL:       *ghIssue.HTMLURL,
+					Number:    *ghIssue.Number,
+					CreatedAt: ghIssue.CreatedAt.Time,
+					Comments:  *ghIssue.Comments,
+					Score:     0.0,
+				}
+				if ghIssue.Labels != nil {
+					for _, label := range ghIssue.Labels {
+						if label.Name != nil {
+							issue.Labels = append(issue.Labels, *label.Name)
+						}
+					}
+				}
+				assignedIssues = append(assignedIssues, issue)
+			}
+		}
+
+		DisplayPartitionedIssues(goodFirstIssues, otherIssues, assignedIssues)
 		return
 	}
 
@@ -2632,6 +3270,88 @@ func main() {
 			for _, issue := range goUpgradeIssues {
 				notifier.logToNotificationsFile(issue.Title, issue.URL, issue.Score, "Go Upgrade")
 			}
+		}
+		return
+	}
+
+	if mode == "confirmed" {
+		log.Printf("\n=== FINDING CONFIRMED GOOD FIRST ISSUES ===")
+		log.Printf("Searching for issues with 'good first issue' + 'confirmed/triage/accepted' labels...")
+
+		if err := finder.rateLimiter.checkRateLimit(ctx); err != nil {
+			log.Printf("Warning: failed to check rate limit: %v", err)
+		}
+
+		targetRepo := os.Getenv("TARGET_REPO")
+		confirmedIssues, err := finder.FindConfirmedGoodFirstIssues(ctx, targetRepo)
+		if err != nil {
+			log.Printf("Error finding confirmed good first issues: %v", err)
+			return
+		}
+
+		PrintConfirmedGoodFirstIssues(confirmedIssues)
+
+		newIssues, err := finder.ProcessNewIssueNotifications(ctx, confirmedIssues)
+		if err != nil {
+			log.Printf("Error processing notifications: %v", err)
+		}
+
+		if len(newIssues) > 0 && finder.notifier != nil {
+			log.Printf("Sending notifications for %d new issues...", len(newIssues))
+			if err := finder.SendLocalAlert(newIssues); err != nil {
+				log.Printf("Error sending local alert: %v", err)
+			}
+			if finder.bot != nil {
+				if err := finder.SendTelegramAlert(newIssues); err != nil {
+					log.Printf("Error sending Telegram alert: %v", err)
+				}
+			}
+		}
+
+		if finder.assignmentMgr != nil && finder.assignmentMgr.IsEnabled() {
+			log.Printf("\n=== PROCESSING ASSIGNMENT REQUESTS ===")
+			eligibleCount := 0
+			for _, issue := range confirmedIssues {
+				if issue.IsEligible {
+					eligibleCount++
+					if eligibleCount > 5 {
+						break
+					}
+					candidate := &AssignmentCandidate{
+						Issue: &github.Issue{
+							Title:            github.String(issue.Title),
+							Number:           github.Int(issue.Number),
+							HTMLURL:          github.String(issue.URL),
+							State:            github.String("open"),
+							Assignees:        nil,
+							Labels:           convertLabels(issue.Labels),
+							PullRequestLinks: nil,
+							CreatedAt:        &github.Timestamp{Time: issue.CreatedAt},
+						},
+						ProjectOrg:  issue.Project.Org,
+						ProjectName: issue.Project.Name,
+						Labels:      issue.Labels,
+						HasPR:       issue.HasLinkedPR,
+					}
+
+					request, err := finder.assignmentMgr.AskForAssignment(ctx, candidate)
+					if err != nil {
+						log.Printf("Assignment request failed for %s#%d: %v", issue.Project.Name, issue.Number, err)
+						continue
+					}
+
+					if request != nil {
+						log.Printf("Assignment status for %s#%d: %s", issue.Project.Name, issue.Number, request.Status)
+						if finder.tracker != nil {
+							finder.tracker.MarkAssignmentAsked(issue.URL)
+						}
+					}
+				}
+			}
+		}
+
+		if notifier != nil {
+			notifier.logToFile(fmt.Sprintf("Found %d confirmed good first issues", len(confirmedIssues)))
 		}
 		return
 	}
