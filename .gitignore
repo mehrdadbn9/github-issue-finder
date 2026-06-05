@@ -1,6 +1,7 @@
 # Binaries
 github-issue-finder
 github-issue-finder.exe
+issue-finder
 
 # Test binary, built with `go test -c`
 *.test
@@ -13,6 +14,10 @@ vendor/
 
 # Environment variables
 .env
+
+# Runtime output
+logs/
+runtime/logs/
 
 # IDE
 .vscode/

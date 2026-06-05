@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,13 +23,39 @@ import (
 	"golang.org/x/oauth2"
 )
 
+var logFile *os.File
+
+// Default scoring weights (must sum to 1.0)
+const (
+	DefaultStarsWeight           float64 = 0.05
+	DefaultCommentsWeight        float64 = 0.15
+	DefaultRecencyWeight         float64 = 0.15
+	DefaultLabelsWeight          float64 = 0.25
+	DefaultDifficultyWeight      float64 = 0.15
+	DefaultProjectPriorityWeight float64 = 0.25
+)
+
 type Config struct {
-	GitHubToken        string `json:"github_token"`
-	TelegramBotToken   string `json:"telegram_bot_token"`
-	TelegramChatID     int64  `json:"telegram_chat_id"`
-	CheckInterval      int    `json:"check_interval"`
-	MaxIssuesPerRepo   int    `json:"max_issues_per_repo"`
-	DBConnectionString string `json:"db_connection_string"`
+	StarsWeight        *float64 `json:"stars_weight,omitempty"`
+	CommentsWeight     *float64 `json:"comments_weight,omitempty"`
+	RecencyWeight      *float64 `json:"recency_weight,omitempty"`
+	LabelsWeight       *float64 `json:"labels_weight,omitempty"`
+	DifficultyWeight   *float64 `json:"difficulty_weight,omitempty"`
+	PriorityWeight     *float64 `json:"priority_weight,omitempty"`
+	GitHubToken        string   `json:"github_token"`
+	GitHubUsername     string   `json:"github_username"`
+	TelegramBotToken   string   `json:"telegram_bot_token"`
+	TelegramChatID     int64    `json:"telegram_chat_id"`
+	CheckInterval      int      `json:"check_interval"`
+	MaxIssuesPerRepo   int      `json:"max_issues_per_repo"`
+	MaxProjects        int      `json:"max_projects"`
+	MaxRecommendations int      `json:"max_recommendations"`
+	MaxPerProject      int      `json:"max_per_project"`
+	MaxPerPriority     int      `json:"max_per_priority"`
+	VerboseSkips       bool     `json:"verbose_skips"`
+	VerifyLinkedPRs    bool     `json:"verify_linked_prs"`
+	DBConnectionString string   `json:"db_connection_string"`
+	LogDir             string   `json:"log_dir"`
 }
 
 type Project struct {
@@ -33,19 +63,28 @@ type Project struct {
 	Name     string
 	Category string
 	Stars    int
+	Priority int
+}
+
+func (p Project) FullName() string {
+	return p.Org + "/" + p.Name
 }
 
 type Issue struct {
-	Project     Project
-	Title       string
-	URL         string
-	Number      int
-	Score       float64
-	CreatedAt   time.Time
-	Comments    int
-	Labels      []string
-	Language    string
-	IsGoodFirst bool
+	Project           Project
+	Title             string
+	URL               string
+	Number            int
+	Score             float64
+	CreatedAt         time.Time
+	UpdatedAt         time.Time
+	Comments          int
+	Labels            []string
+	Language          string
+	IsGoodFirst       bool
+	AssignedToMe      bool
+	Recommendation    string
+	ContributionState string
 }
 
 type IssueScorer struct {
@@ -53,13 +92,60 @@ type IssueScorer struct {
 }
 
 func NewIssueScorer() *IssueScorer {
+	return NewIssueScorerWithConfig(&Config{})
+}
+
+func NewIssueScorerWithConfig(config *Config) *IssueScorer {
+	starsWeight := DefaultStarsWeight
+	if config.StarsWeight != nil {
+		starsWeight = *config.StarsWeight
+	}
+
+	commentsWeight := DefaultCommentsWeight
+	if config.CommentsWeight != nil {
+		commentsWeight = *config.CommentsWeight
+	}
+
+	recencyWeight := DefaultRecencyWeight
+	if config.RecencyWeight != nil {
+		recencyWeight = *config.RecencyWeight
+	}
+
+	labelsWeight := DefaultLabelsWeight
+	if config.LabelsWeight != nil {
+		labelsWeight = *config.LabelsWeight
+	}
+
+	difficultyWeight := DefaultDifficultyWeight
+	if config.DifficultyWeight != nil {
+		difficultyWeight = *config.DifficultyWeight
+	}
+
+	priorityWeight := DefaultProjectPriorityWeight
+	if config.PriorityWeight != nil {
+		priorityWeight = *config.PriorityWeight
+	}
+
+	total := starsWeight + commentsWeight + recencyWeight + labelsWeight + difficultyWeight + priorityWeight
+	if total <= 0 {
+		log.Printf("Warning: invalid scoring weights, falling back to defaults")
+		starsWeight = DefaultStarsWeight
+		commentsWeight = DefaultCommentsWeight
+		recencyWeight = DefaultRecencyWeight
+		labelsWeight = DefaultLabelsWeight
+		difficultyWeight = DefaultDifficultyWeight
+		priorityWeight = DefaultProjectPriorityWeight
+		total = starsWeight + commentsWeight + recencyWeight + labelsWeight + difficultyWeight + priorityWeight
+	}
+
 	return &IssueScorer{
 		weights: map[string]float64{
-			"stars_factor":      0.15,
-			"comments_factor":   0.20,
-			"recency_factor":    0.20,
-			"labels_factor":     0.25,
-			"difficulty_factor": 0.20,
+			"stars_factor":      starsWeight / total,
+			"comments_factor":   commentsWeight / total,
+			"recency_factor":    recencyWeight / total,
+			"labels_factor":     labelsWeight / total,
+			"difficulty_factor": difficultyWeight / total,
+			"priority_factor":   priorityWeight / total,
 		},
 	}
 }
@@ -70,17 +156,20 @@ func (s *IssueScorer) ScoreIssue(issue *github.Issue, project Project) float64 {
 	starsScore := s.normalizeStars(project.Stars)
 	score += starsScore * s.weights["stars_factor"]
 
-	commentsScore := s.normalizeComments(*issue.Comments)
+	commentsScore := s.normalizeComments(issue.GetComments())
 	score += commentsScore * s.weights["comments_factor"]
 
-	recencyScore := s.normalizeRecency(issue.CreatedAt.Time)
+	recencyScore := s.normalizeRecency(issue.GetCreatedAt().Time)
 	score += recencyScore * s.weights["recency_factor"]
 
 	labelsScore := s.normalizeLabels(issue.Labels)
 	score += labelsScore * s.weights["labels_factor"]
 
-	difficultyScore := s.normalizeDifficulty(issue.Labels, *issue.Body)
+	difficultyScore := s.normalizeDifficulty(issue.Labels, issue.GetBody())
 	score += difficultyScore * s.weights["difficulty_factor"]
+
+	priorityScore := s.normalizePriority(project.Priority)
+	score += priorityScore * s.weights["priority_factor"]
 
 	return score
 }
@@ -98,11 +187,11 @@ func (s *IssueScorer) normalizeStars(stars int) float64 {
 
 func (s *IssueScorer) normalizeComments(comments int) float64 {
 	if comments <= 2 {
-		return 0.7
+		return 1.0
 	} else if comments <= 5 {
-		return 0.5
+		return 0.7
 	} else if comments <= 10 {
-		return 0.3
+		return 0.4
 	}
 	return 0.1
 }
@@ -123,33 +212,33 @@ func (s *IssueScorer) normalizeRecency(createdAt time.Time) float64 {
 
 func (s *IssueScorer) normalizeLabels(labels []*github.Label) float64 {
 	score := 0.0
-	hasGoodLabels := false
-	hasBadLabels := false
 
 	for _, label := range labels {
 		labelName := strings.ToLower(label.GetName())
 
 		if strings.Contains(labelName, "good first issue") ||
 			strings.Contains(labelName, "help wanted") ||
-			strings.Contains(labelName, "bug") ||
-			strings.Contains(labelName, "enhancement") {
-			score += 0.3
-			hasGoodLabels = true
+			strings.Contains(labelName, "good-first") ||
+			strings.Contains(labelName, "easy") ||
+			strings.Contains(labelName, "beginner") ||
+			strings.Contains(labelName, "starter") {
+			score += 0.45
 		}
 
-		if strings.Contains(labelName, "documentation") {
-			score += 0.2
-			hasGoodLabels = true
+		if strings.Contains(labelName, "bug") ||
+			strings.Contains(labelName, "kind/bug") ||
+			strings.Contains(labelName, "type/bug") ||
+			strings.Contains(labelName, "defect") {
+			score += 0.25
 		}
 
-		if strings.Contains(labelName, "complex") ||
-			strings.Contains(labelName, "hard") ||
-			strings.Contains(labelName, "refactor") {
-			hasBadLabels = true
+		if strings.Contains(labelName, "needs-triage") ||
+			strings.Contains(labelName, "triage") {
+			score += 0.1
 		}
 	}
 
-	if hasGoodLabels && !hasBadLabels {
+	if score > 1.0 {
 		return 1.0
 	}
 	return score
@@ -168,13 +257,14 @@ func (s *IssueScorer) normalizeDifficulty(labels []*github.Label, body string) f
 	}
 
 	if hasGoodFirst {
-		return 0.7
+		return 1.0
 	}
 
 	if strings.Contains(bodyLower, "simple") ||
 		strings.Contains(bodyLower, "basic") ||
-		strings.Contains(bodyLower, "small") {
-		return 0.6
+		strings.Contains(bodyLower, "small") ||
+		strings.Contains(bodyLower, "straightforward") {
+		return 0.75
 	}
 
 	if strings.Contains(bodyLower, "complex") ||
@@ -186,11 +276,25 @@ func (s *IssueScorer) normalizeDifficulty(labels []*github.Label, body string) f
 	return 0.4
 }
 
+func (s *IssueScorer) normalizePriority(priority int) float64 {
+	switch priority {
+	case 1:
+		return 1.0
+	case 2:
+		return 0.9
+	case 3:
+		return 0.8
+	default:
+		return 0.2
+	}
+}
+
 type IssueFinder struct {
 	config     *Config
 	client     *github.Client
 	bot        *tgbotapi.BotAPI
 	db         *sqlx.DB
+	hasDB      bool
 	scorer     *IssueScorer
 	projects   []Project
 	seenIssues map[string]bool
@@ -198,37 +302,63 @@ type IssueFinder struct {
 }
 
 func NewIssueFinder(config *Config) (*IssueFinder, error) {
-	ctx := context.Background()
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: config.GitHubToken},
-	)
-	tc := oauth2.NewClient(ctx, ts)
-
-	bot, err := tgbotapi.NewBotAPI(config.TelegramBotToken)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create Telegram bot: %w", err)
-	}
-
-	db, err := sqlx.Connect("postgres", config.DBConnectionString)
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to database: %w", err)
-	}
-
 	finder := &IssueFinder{
 		config:     config,
-		client:     github.NewClient(tc),
-		bot:        bot,
-		db:         db,
-		scorer:     NewIssueScorer(),
+		scorer:     NewIssueScorerWithConfig(config),
 		seenIssues: make(map[string]bool),
 	}
 
-	if err := finder.initDB(); err != nil {
-		return nil, fmt.Errorf("failed to initialize database: %w", err)
+	if config.GitHubToken != "" {
+		ctx := context.Background()
+		ts := oauth2.StaticTokenSource(
+			&oauth2.Token{AccessToken: config.GitHubToken},
+		)
+		tc := oauth2.NewClient(ctx, ts)
+		finder.client = github.NewClient(tc)
+		if config.GitHubUsername == "" {
+			if user, _, err := finder.client.Users.Get(ctx, ""); err == nil {
+				config.GitHubUsername = user.GetLogin()
+				log.Printf("GitHub username detected as %s", config.GitHubUsername)
+			} else {
+				log.Printf("Warning: failed to detect GitHub username: %v", err)
+			}
+		}
+	} else {
+		finder.client = github.NewClient(nil)
 	}
 
-	if err := finder.loadSeenIssues(); err != nil {
-		log.Printf("Warning: failed to load seen issues: %v", err)
+	if config.TelegramBotToken != "" {
+		bot, err := createTelegramBot(config.TelegramBotToken)
+		if err != nil {
+			log.Printf("Warning: failed to create Telegram bot, running in console-only mode: %v", err)
+		} else {
+			finder.bot = bot
+			log.Println("Telegram bot initialized successfully")
+		}
+	} else {
+		log.Println("No Telegram bot token provided, running in console-only mode")
+	}
+
+	if config.DBConnectionString != "" {
+		db, err := sqlx.Connect("postgres", config.DBConnectionString)
+		if err != nil {
+			log.Printf("Warning: failed to connect to database, running in memory-only mode: %v", err)
+		} else {
+			finder.db = db
+			finder.hasDB = true
+			if err := finder.initDB(); err != nil {
+				log.Printf("Warning: failed to initialize database, running in memory-only mode: %v", err)
+				finder.hasDB = false
+			}
+		}
+	} else {
+		log.Println("No database connection string provided, running in memory-only mode")
+	}
+
+	if finder.hasDB {
+		if err := finder.loadSeenIssues(); err != nil {
+			log.Printf("Warning: failed to load seen issues: %v", err)
+		}
 	}
 
 	finder.initializeProjects()
@@ -236,7 +366,14 @@ func NewIssueFinder(config *Config) (*IssueFinder, error) {
 	return finder, nil
 }
 
+func createTelegramBot(token string) (*tgbotapi.BotAPI, error) {
+	return tgbotapi.NewBotAPI(token)
+}
+
 func (f *IssueFinder) initDB() error {
+	if f.db == nil {
+		return nil
+	}
 	schema := `
 	CREATE TABLE IF NOT EXISTS seen_issues (
 		id SERIAL PRIMARY KEY,
@@ -271,6 +408,9 @@ func (f *IssueFinder) initDB() error {
 }
 
 func (f *IssueFinder) loadSeenIssues() error {
+	if f.db == nil {
+		return nil
+	}
 	var issueIDs []string
 	err := f.db.Select(&issueIDs, "SELECT issue_id FROM seen_issues")
 	if err != nil {
@@ -292,6 +432,10 @@ func (f *IssueFinder) markIssueSeen(issueID, projectName string) error {
 	f.seenIssues[issueID] = true
 	f.mu.Unlock()
 
+	if f.db == nil {
+		return nil
+	}
+
 	_, err := f.db.Exec(`
 		INSERT INTO seen_issues (issue_id, project_name, first_seen, last_notified)
 		VALUES ($1, $2, $3, $3)
@@ -302,15 +446,282 @@ func (f *IssueFinder) markIssueSeen(issueID, projectName string) error {
 }
 
 func (f *IssueFinder) saveIssueHistory(issue Issue) error {
+	if f.db == nil {
+		return nil
+	}
+
 	labelsJSON, _ := json.Marshal(issue.Labels)
 
 	_, err := f.db.Exec(`
 		INSERT INTO issue_history (issue_id, issue_title, issue_url, project_name, category, score, comments, labels, created_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		ON CONFLICT DO NOTHING
-	`, fmt.Sprintf("%s/%d", issue.Project.Name, issue.Number), issue.Title, issue.URL, issue.Project.Name, issue.Project.Category, issue.Score, issue.Comments, labelsJSON, issue.CreatedAt)
+	`, f.issueID(issue.Project, issue.Number), issue.Title, issue.URL, issue.Project.Name, issue.Project.Category, issue.Score, issue.Comments, labelsJSON, issue.CreatedAt)
 
 	return err
+}
+
+func (f *IssueFinder) issueID(project Project, number int) string {
+	return fmt.Sprintf("%s#%d", project.FullName(), number)
+}
+
+func (f *IssueFinder) isCandidateIssue(issue *github.Issue) (bool, string) {
+	if issue.IsPullRequest() {
+		return false, "pull request"
+	}
+
+	if issue.GetLocked() {
+		return false, "locked issue"
+	}
+
+	if issue.GetState() != "" && issue.GetState() != "open" {
+		return false, "not open"
+	}
+
+	assignedToMe, assignedToOther := f.assignmentState(issue)
+	if assignedToOther && !assignedToMe {
+		return false, "assigned to someone else"
+	}
+
+	labels := lowerLabelNames(issue.Labels)
+	if hasAnySubstring(labels, []string{
+		"duplicate",
+		"invalid",
+		"wontfix",
+		"won't fix",
+		"not planned",
+		"declined",
+		"stale",
+		"blocked",
+		"needs info",
+		"needs-info",
+		"needs more information",
+		"waiting for user",
+		"question",
+		"support",
+		"discussion",
+		"meta",
+		"tracking",
+		"umbrella",
+		"epic",
+		"rfc",
+		"has_pr",
+		"has-pr",
+		"has pr",
+		"pr exists",
+		"in progress",
+	}) {
+		return false, "non-actionable label"
+	}
+
+	hasContributorLabel := hasAnySubstring(labels, []string{
+		"good first issue",
+		"good-first",
+		"help wanted",
+		"beginner",
+		"easy",
+		"starter",
+	})
+	hasRealIssueLabel := hasAnySubstring(labels, []string{
+		"bug",
+		"kind/bug",
+		"type/bug",
+		"defect",
+		"regression",
+		"flaky",
+		"failure",
+	})
+	hasOnlyDocsLabel := hasAnySubstring(labels, []string{"documentation", "docs"}) && !hasRealIssueLabel && !hasContributorLabel
+	if hasOnlyDocsLabel {
+		return false, "docs-only issue"
+	}
+
+	text := strings.ToLower(issue.GetTitle() + "\n" + issue.GetBody())
+	if looksLikeMaintenanceNotice(text) {
+		return false, "maintenance/announcement issue"
+	}
+
+	if looksLikeSupportRequest(text) && !hasContributorLabel && !hasRealIssueLabel {
+		return false, "support/discussion style issue"
+	}
+
+	if hasAnySubstring(labels, []string{"feature", "enhancement"}) && !hasContributorLabel && !hasRealIssueLabel {
+		return false, "feature/enhancement without contributor signal"
+	}
+
+	if !hasContributorLabel && !hasRealIssueLabel && !looksLikeProblemReport(text) {
+		return false, "not a clear actionable bug"
+	}
+
+	if strings.TrimSpace(issue.GetBody()) == "" && !hasContributorLabel && !hasRealIssueLabel {
+		return false, "empty body without useful labels"
+	}
+
+	return true, ""
+}
+
+func (f *IssueFinder) assignmentState(issue *github.Issue) (assignedToMe bool, assignedToOther bool) {
+	if len(issue.Assignees) == 0 {
+		return false, false
+	}
+
+	username := strings.ToLower(strings.TrimSpace(f.config.GitHubUsername))
+	for _, assignee := range issue.Assignees {
+		login := strings.ToLower(assignee.GetLogin())
+		if username != "" && login == username {
+			assignedToMe = true
+		} else {
+			assignedToOther = true
+		}
+	}
+
+	return assignedToMe, assignedToOther
+}
+
+func (f *IssueFinder) contributionState(issue *github.Issue) string {
+	assignedToMe, assignedToOther := f.assignmentState(issue)
+	if assignedToMe {
+		return "assigned to you"
+	}
+	if assignedToOther {
+		return "assigned to someone else"
+	}
+	return "unassigned"
+}
+
+func (f *IssueFinder) recommendationReason(issue *github.Issue, project Project) string {
+	reasons := []string{}
+
+	switch project.Priority {
+	case 1:
+		reasons = append(reasons, "KEDA focus repo")
+	case 2:
+		reasons = append(reasons, "Kubernetes/CNCF core repo")
+	case 3:
+		reasons = append(reasons, "Kafka/messaging repo")
+	case 4:
+		reasons = append(reasons, "monitoring/observability repo")
+	case 5:
+		reasons = append(reasons, "Ansible focus repo")
+	case 6:
+		reasons = append(reasons, "important CNCF repo")
+	}
+
+	labels := lowerLabelNames(issue.Labels)
+	if hasAnySubstring(labels, []string{"good first issue", "good-first", "help wanted", "beginner", "easy", "starter"}) {
+		reasons = append(reasons, "contributor-friendly label")
+	}
+	if hasAnySubstring(labels, []string{"bug", "kind/bug", "type/bug", "defect", "regression"}) {
+		reasons = append(reasons, "real bug label")
+	}
+	if issue.GetComments() <= 2 {
+		reasons = append(reasons, "low discussion/competition")
+	}
+	if state := f.contributionState(issue); state != "" {
+		reasons = append(reasons, state)
+	}
+
+	if len(reasons) == 0 {
+		return "passes contribution filters"
+	}
+	return strings.Join(reasons, "; ")
+}
+
+func (f *IssueFinder) logSkip(project Project, issueNumber int, reason string) {
+	if !f.config.VerboseSkips {
+		return
+	}
+	log.Printf("Skipping %s#%d: %s", project.FullName(), issueNumber, reason)
+}
+
+func lowerLabelNames(labels []*github.Label) []string {
+	names := make([]string, 0, len(labels))
+	for _, label := range labels {
+		names = append(names, strings.ToLower(label.GetName()))
+	}
+	return names
+}
+
+func hasAnySubstring(values []string, needles []string) bool {
+	for _, value := range values {
+		for _, needle := range needles {
+			if strings.Contains(value, needle) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func looksLikeSupportRequest(text string) bool {
+	supportTerms := []string{
+		"how do i",
+		"how can i",
+		"question",
+		"help me",
+		"does anyone know",
+		"feature request",
+		"proposal",
+		"discussion",
+		"tracking issue",
+		"umbrella issue",
+		"rfc",
+	}
+
+	for _, term := range supportTerms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeMaintenanceNotice(text string) bool {
+	maintenanceTerms := []string{
+		"dependency dashboard",
+		"eol announcement",
+		"end of life",
+		"release checklist",
+		"release tracking",
+		"roadmap",
+		"deprecation notice",
+	}
+
+	for _, term := range maintenanceTerms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
+}
+
+func looksLikeProblemReport(text string) bool {
+	problemTerms := []string{
+		"bug",
+		"regression",
+		"fails",
+		"failed",
+		"failure",
+		"error",
+		"unable",
+		"cannot",
+		"can't",
+		"not working",
+		"panic",
+		"crash",
+		"timeout",
+		"stuck",
+		"missing",
+		"incorrect",
+		"wrong",
+	}
+
+	for _, term := range problemTerms {
+		if strings.Contains(text, term) {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *IssueFinder) initializeProjects() {
@@ -526,35 +937,168 @@ func (f *IssueFinder) initializeProjects() {
 		{Org: "rust-lang", Name: "cargo", Category: "CI/CD", Stars: 5000},
 	}
 
+	f.prioritizeProjects()
+}
+
+func (f *IssueFinder) prioritizeProjects() {
+	f.projects = append(f.projects,
+		Project{Org: "apache", Name: "kafka", Category: "Messaging", Stars: 29000},
+		Project{Org: "strimzi", Name: "strimzi-kafka-operator", Category: "Messaging", Stars: 5000},
+		Project{Org: "rabbitmq", Name: "rabbitmq-server", Category: "Messaging", Stars: 12000},
+		Project{Org: "rabbitmq", Name: "rabbitmq-management", Category: "Messaging", Stars: 1000},
+		Project{Org: "rabbitmq", Name: "cluster-operator", Category: "Kubernetes", Stars: 900},
+		Project{Org: "rabbitmq", Name: "messaging-topology-operator", Category: "Kubernetes", Stars: 400},
+		Project{Org: "ansible", Name: "ansible", Category: "Automation", Stars: 65000},
+		Project{Org: "ansible", Name: "ansible-lint", Category: "Automation", Stars: 4000},
+		Project{Org: "etcd-io", Name: "etcd", Category: "Kubernetes", Stars: 49000},
+		Project{Org: "envoyproxy", Name: "envoy", Category: "Kubernetes", Stars: 27000},
+		Project{Org: "istio", Name: "istio", Category: "Kubernetes", Stars: 36000},
+		Project{Org: "cert-manager", Name: "cert-manager", Category: "Kubernetes", Stars: 13000},
+		Project{Org: "kubernetes-sigs", Name: "gateway-api", Category: "Kubernetes", Stars: 2500},
+		Project{Org: "kubernetes-sigs", Name: "controller-runtime", Category: "Kubernetes", Stars: 3000},
+		Project{Org: "open-telemetry", Name: "opentelemetry-operator", Category: "Monitoring", Stars: 1600},
+		Project{Org: "prometheus-operator", Name: "kube-prometheus", Category: "Monitoring", Stars: 7000},
+	)
+
+	seen := make(map[string]bool, len(f.projects))
+	deduped := make([]Project, 0, len(f.projects))
+	for _, project := range f.projects {
+		project.Priority = projectPriority(project)
+		key := strings.ToLower(project.FullName())
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		deduped = append(deduped, project)
+	}
+	f.projects = deduped
+
 	sort.Slice(f.projects, func(i, j int) bool {
+		leftPriority := projectSortPriority(f.projects[i])
+		rightPriority := projectSortPriority(f.projects[j])
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
 		return f.projects[i].Stars > f.projects[j].Stars
 	})
+}
+
+func projectPriority(project Project) int {
+	fullName := strings.ToLower(project.FullName())
+	name := strings.ToLower(project.Name)
+
+	switch {
+	case fullName == "kedacore/keda":
+		return 1
+	case isKubernetesCoreProject(fullName):
+		return 2
+	case isKafkaOrMessagingProject(fullName, name):
+		return 3
+	case isMonitoringProject(fullName):
+		return 4
+	case strings.HasPrefix(fullName, "ansible/"):
+		return 5
+	case isImportantCNCFProject(fullName):
+		return 6
+	case project.Priority > 0:
+		return project.Priority
+	default:
+		return 50
+	}
+}
+
+func projectSortPriority(project Project) int {
+	return project.Priority
+}
+
+func isKubernetesCoreProject(fullName string) bool {
+	coreProjects := map[string]bool{
+		"kubernetes/kubernetes":                   true,
+		"helm/helm":                               true,
+		"cilium/cilium":                           true,
+		"etcd-io/etcd":                            true,
+		"containerd/containerd":                   true,
+		"coredns/coredns":                         true,
+		"envoyproxy/envoy":                        true,
+		"istio/istio":                             true,
+		"fluxcd/flux2":                            true,
+		"argoproj/argo-cd":                        true,
+		"open-policy-agent/opa":                   true,
+		"cert-manager/cert-manager":               true,
+		"kubernetes-sigs/gateway-api":             true,
+		"kubernetes-sigs/controller-runtime":      true,
+		"kubernetes-sigs/krew":                    true,
+		"prometheus-operator/prometheus-operator": true,
+	}
+	return coreProjects[fullName]
+}
+
+func isKafkaOrMessagingProject(fullName, name string) bool {
+	return fullName == "apache/kafka" ||
+		fullName == "strimzi/strimzi-kafka-operator" ||
+		strings.Contains(name, "kafka") ||
+		strings.HasPrefix(fullName, "rabbitmq/") ||
+		strings.Contains(name, "rabbitmq")
+}
+
+func isMonitoringProject(fullName string) bool {
+	monitoringProjects := map[string]bool{
+		"prometheus/prometheus":                          true,
+		"prometheus/alertmanager":                        true,
+		"prometheus/node_exporter":                       true,
+		"prometheus/blackbox_exporter":                   true,
+		"prometheus-operator/kube-prometheus":            true,
+		"grafana/grafana":                                true,
+		"grafana/loki":                                   true,
+		"grafana/tempo":                                  true,
+		"grafana/mimir":                                  true,
+		"grafana/k6":                                     true,
+		"open-telemetry/opentelemetry-collector":         true,
+		"open-telemetry/opentelemetry-collector-contrib": true,
+		"open-telemetry/opentelemetry-operator":          true,
+		"jaegertracing/jaeger":                           true,
+		"thanos-io/thanos":                               true,
+		"kubernetes/kube-state-metrics":                  true,
+	}
+	return monitoringProjects[fullName]
+}
+
+func isImportantCNCFProject(fullName string) bool {
+	projects := map[string]bool{
+		"argoproj/argo-workflows": true,
+		"argoproj/argo-events":    true,
+		"argoproj/argo-rollouts":  true,
+		"vmware-tanzu/velero":     true,
+		"rook/rook":               true,
+		"crossplane/crossplane":   true,
+		"kyverno/kyverno":         true,
+		"falcosecurity/falco":     true,
+		"aquasecurity/trivy":      true,
+		"linkerd/linkerd2":        true,
+		"knative/knative":         true,
+		"tektoncd/pipeline":       true,
+		"dragonflydb/dragonfly":   true,
+	}
+	return projects[fullName]
 }
 
 func (f *IssueFinder) FindIssues(ctx context.Context) ([]Issue, error) {
 	var allIssues []Issue
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-
-	issuesChan := make(chan Issue, 100)
-
-	workerCount := 5
-	for i := 0; i < workerCount; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for issue := range issuesChan {
-				mu.Lock()
-				allIssues = append(allIssues, issue)
-				mu.Unlock()
-			}
-		}()
-	}
+	limiter := make(chan struct{}, 5)
 
 	for _, project := range f.projects {
 		wg.Add(1)
 		go func(p Project) {
 			defer wg.Done()
+
+			select {
+			case limiter <- struct{}{}:
+				defer func() { <-limiter }()
+			case <-ctx.Done():
+				return
+			}
 
 			log.Printf("Checking issues for %s/%s (%d stars)", p.Org, p.Name, p.Stars)
 
@@ -574,11 +1118,12 @@ func (f *IssueFinder) FindIssues(ctx context.Context) ([]Issue, error) {
 			}
 
 			for _, issue := range issues {
-				if issue.IsPullRequest() {
+				if ok, reason := f.isCandidateIssue(issue); !ok {
+					f.logSkip(p, issue.GetNumber(), reason)
 					continue
 				}
 
-				issueID := fmt.Sprintf("%s/%d", p.Name, *issue.Number)
+				issueID := f.issueID(p, issue.GetNumber())
 
 				f.mu.RLock()
 				seen := f.seenIssues[issueID]
@@ -604,39 +1149,143 @@ func (f *IssueFinder) FindIssues(ctx context.Context) ([]Issue, error) {
 				}
 
 				newIssue := Issue{
-					Project:     p,
-					Title:       *issue.Title,
-					URL:         *issue.HTMLURL,
-					Number:      *issue.Number,
-					Score:       score,
-					CreatedAt:   issue.CreatedAt.Time,
-					Comments:    *issue.Comments,
-					Labels:      labels,
-					Language:    "Go",
-					IsGoodFirst: isGoodFirst,
+					Project:           p,
+					Title:             issue.GetTitle(),
+					URL:               issue.GetHTMLURL(),
+					Number:            issue.GetNumber(),
+					Score:             score,
+					CreatedAt:         issue.GetCreatedAt().Time,
+					UpdatedAt:         issue.GetUpdatedAt().Time,
+					Comments:          issue.GetComments(),
+					Labels:            labels,
+					Language:          "Go",
+					IsGoodFirst:       isGoodFirst,
+					AssignedToMe:      f.contributionState(issue) == "assigned to you",
+					ContributionState: f.contributionState(issue),
+					Recommendation:    f.recommendationReason(issue, p),
 				}
 
-				issuesChan <- newIssue
-
-				if err := f.markIssueSeen(issueID, p.Name); err != nil {
-					log.Printf("Error marking issue %s as seen: %v", issueID, err)
-				}
-
-				if err := f.saveIssueHistory(newIssue); err != nil {
-					log.Printf("Error saving issue history: %v", err)
-				}
+				mu.Lock()
+				allIssues = append(allIssues, newIssue)
+				mu.Unlock()
 			}
 		}(project)
 	}
 
 	wg.Wait()
-	close(issuesChan)
 
 	sort.Slice(allIssues, func(i, j int) bool {
 		return allIssues[i].Score > allIssues[j].Score
 	})
 
+	allIssues = f.filterLinkedPullRequests(ctx, allIssues)
+	if f.config.MaxRecommendations > 0 && len(allIssues) > f.config.MaxRecommendations {
+		allIssues = allIssues[:f.config.MaxRecommendations]
+	}
+
+	for _, issue := range allIssues {
+		issueID := f.issueID(issue.Project, issue.Number)
+		if err := f.markIssueSeen(issueID, issue.Project.Name); err != nil {
+			log.Printf("Error marking issue %s as seen: %v", issueID, err)
+		}
+
+		if err := f.saveIssueHistory(issue); err != nil {
+			log.Printf("Error saving issue history: %v", err)
+		}
+	}
+
 	return allIssues, nil
+}
+
+func (f *IssueFinder) filterLinkedPullRequests(ctx context.Context, issues []Issue) []Issue {
+	filtered := make([]Issue, 0, len(issues))
+	perProjectCounts := make(map[string]int)
+	perPriorityCounts := make(map[int]int)
+	warnedLinkedPRVerification := false
+
+	for _, issue := range issues {
+		if f.outputLimitReached(len(filtered)) {
+			break
+		}
+
+		if f.projectLimitReached(perProjectCounts, issue.Project) ||
+			f.priorityLimitReached(perPriorityCounts, issue.Project.Priority) {
+			continue
+		}
+
+		if f.config.VerifyLinkedPRs {
+			hasPR, err := f.hasOpenLinkedPullRequest(ctx, issue.Project, issue.Number)
+			if err != nil {
+				if !warnedLinkedPRVerification {
+					log.Printf("Warning: linked PR verification failed; skipping unverified issues until GitHub API access recovers: %v", err)
+					warnedLinkedPRVerification = true
+				}
+				continue
+			} else if hasPR {
+				f.logSkip(issue.Project, issue.Number, "open linked pull request")
+				continue
+			}
+		}
+
+		filtered = append(filtered, issue)
+		perProjectCounts[strings.ToLower(issue.Project.FullName())]++
+		perPriorityCounts[issue.Project.Priority]++
+	}
+
+	return filtered
+}
+
+func (f *IssueFinder) outputLimitReached(currentCount int) bool {
+	return f.config.MaxRecommendations > 0 && currentCount >= f.config.MaxRecommendations
+}
+
+func (f *IssueFinder) projectLimitReached(counts map[string]int, project Project) bool {
+	if f.config.MaxPerProject <= 0 {
+		return false
+	}
+	return counts[strings.ToLower(project.FullName())] >= f.config.MaxPerProject
+}
+
+func (f *IssueFinder) priorityLimitReached(counts map[int]int, priority int) bool {
+	if f.config.MaxPerPriority <= 0 {
+		return false
+	}
+	return counts[priority] >= f.config.MaxPerPriority
+}
+
+func (f *IssueFinder) hasOpenLinkedPullRequest(ctx context.Context, project Project, issueNumber int) (bool, error) {
+	opts := &github.ListOptions{PerPage: 100}
+
+	for {
+		events, resp, err := f.client.Issues.ListIssueTimeline(ctx, project.Org, project.Name, issueNumber, opts)
+		if err != nil {
+			return false, err
+		}
+
+		for _, event := range events {
+			if event.GetEvent() != "cross-referenced" {
+				continue
+			}
+			source := event.GetSource()
+			if source == nil {
+				continue
+			}
+			sourceIssue := source.GetIssue()
+			if sourceIssue == nil || !sourceIssue.IsPullRequest() {
+				continue
+			}
+			if sourceIssue.GetState() == "" || sourceIssue.GetState() == "open" {
+				return true, nil
+			}
+		}
+
+		if resp == nil || resp.NextPage == 0 {
+			break
+		}
+		opts.Page = resp.NextPage
+	}
+
+	return false, nil
 }
 
 func (f *IssueFinder) SendTelegramAlert(issues []Issue) error {
@@ -644,13 +1293,20 @@ func (f *IssueFinder) SendTelegramAlert(issues []Issue) error {
 		return nil
 	}
 
-	var messages []string
+	if f.bot == nil || f.config.TelegramChatID == 0 {
+		return f.outputToConsole(issues)
+	}
 
-	header := fmt.Sprintf("🚀 *New Learning Opportunities in Go DevOps Projects*\n\n")
-	messages = append(messages, header)
+	return f.sendTelegramMessages(issues)
+}
 
+func (f *IssueFinder) outputToConsole(issues []Issue) error {
+	header := fmt.Sprintf("🚀 New Learning Opportunities in Go DevOps Projects\n\n")
+	log.Print(header)
+
+	limit := f.outputLimit(len(issues))
 	for i, issue := range issues {
-		if i >= 20 {
+		if i >= limit {
 			break
 		}
 
@@ -669,7 +1325,7 @@ func (f *IssueFinder) SendTelegramAlert(issues []Issue) error {
 		}
 
 		msg := fmt.Sprintf(
-			"%s *%s* (%.2f)\n%s\n%s/%s (%d★)%s\n\n",
+			"%s %s (%.2f)\n%s\n%s/%s (%d★)\nFit: %s\nStatus: %s%s\n\n",
 			scoreEmoji,
 			truncateString(issue.Title, 80),
 			issue.Score,
@@ -677,6 +1333,54 @@ func (f *IssueFinder) SendTelegramAlert(issues []Issue) error {
 			issue.Project.Org,
 			issue.Project.Name,
 			issue.Project.Stars,
+			issue.Recommendation,
+			issue.ContributionState,
+			labelsText,
+		)
+
+		log.Print(msg)
+	}
+
+	return nil
+}
+
+func (f *IssueFinder) sendTelegramMessages(issues []Issue) error {
+	var messages []string
+
+	header := fmt.Sprintf("🚀 *New Learning Opportunities in Go DevOps Projects*\n\n")
+	messages = append(messages, header)
+
+	limit := f.outputLimit(len(issues))
+	for i, issue := range issues {
+		if i >= limit {
+			break
+		}
+
+		scoreEmoji := ""
+		if issue.Score >= 0.8 {
+			scoreEmoji = "🔥"
+		} else if issue.Score >= 0.6 {
+			scoreEmoji = "⭐"
+		} else {
+			scoreEmoji = "✨"
+		}
+
+		labelsText := ""
+		if len(issue.Labels) > 0 {
+			labelsText = fmt.Sprintf("\nLabels: %s", strings.Join(issue.Labels, ", "))
+		}
+
+		msg := fmt.Sprintf(
+			"%s *%s* (%.2f)\n%s\n%s/%s (%d★)\nFit: %s\nStatus: %s%s\n\n",
+			scoreEmoji,
+			truncateString(issue.Title, 80),
+			issue.Score,
+			issue.URL,
+			issue.Project.Org,
+			issue.Project.Name,
+			issue.Project.Stars,
+			issue.Recommendation,
+			issue.ContributionState,
 			labelsText,
 		)
 
@@ -699,8 +1403,19 @@ func (f *IssueFinder) SendTelegramAlert(issues []Issue) error {
 	return nil
 }
 
+func (f *IssueFinder) outputLimit(issueCount int) int {
+	if f.config.MaxRecommendations <= 0 || f.config.MaxRecommendations > issueCount {
+		return issueCount
+	}
+	return f.config.MaxRecommendations
+}
+
 func (f *IssueFinder) GetTopIssues(limit int) ([]Issue, error) {
 	var issues []Issue
+
+	if f.db == nil {
+		return issues, nil
+	}
 
 	query := `
 		SELECT 
@@ -1093,28 +1808,129 @@ func truncateString(s string, maxLen int) string {
 }
 
 func main() {
+	once := flag.Bool("once", false, "Run a single check and exit")
+	maxProjects := flag.Int("max-projects", 20, "Maximum number of projects to check")
+	maxIssuesPerRepo := flag.Int("max-issues-per-repo", 30, "Maximum number of issues to fetch per repo")
+	maxRecommendations := flag.Int("max-recommendations", 10, "Maximum number of recommendations to output")
+	maxPerProject := flag.Int("max-per-project", 2, "Maximum number of recommendations per project")
+	maxPerPriority := flag.Int("max-per-priority", 4, "Maximum number of recommendations per priority tier")
+	verboseSkips := flag.Bool("verbose-skips", false, "Log every skipped issue with the skip reason")
+	verifyLinkedPRs := flag.Bool("verify-linked-prs", true, "Verify and skip issues that already have an open linked PR")
+	flag.Parse()
+
 	config := &Config{
 		GitHubToken:        os.Getenv("GITHUB_TOKEN"),
+		GitHubUsername:     os.Getenv("GITHUB_USERNAME"),
 		TelegramBotToken:   os.Getenv("TELEGRAM_BOT_TOKEN"),
-		TelegramChatID:     683539779,
 		CheckInterval:      3600,
-		MaxIssuesPerRepo:   10,
-		DBConnectionString: "host=localhost user=postgres password=postgres dbname=issue_finder sslmode=disable port=5432",
+		MaxIssuesPerRepo:   *maxIssuesPerRepo,
+		MaxProjects:        *maxProjects,
+		MaxRecommendations: *maxRecommendations,
+		MaxPerProject:      *maxPerProject,
+		MaxPerPriority:     *maxPerPriority,
+		VerboseSkips:       *verboseSkips,
+		VerifyLinkedPRs:    *verifyLinkedPRs,
+		DBConnectionString: os.Getenv("DB_CONNECTION_STRING"),
+		LogDir:             os.Getenv("LOG_DIR"),
 	}
 
-	if config.GitHubToken == "" {
-		log.Fatal("GITHUB_TOKEN environment variable is required")
+	if chatIDStr := os.Getenv("TELEGRAM_CHAT_ID"); chatIDStr != "" {
+		var chatID int64
+		if _, err := fmt.Sscanf(chatIDStr, "%d", &chatID); err == nil {
+			config.TelegramChatID = chatID
+		}
+	}
+	if intervalStr := os.Getenv("CHECK_INTERVAL"); intervalStr != "" {
+		var interval int
+		if _, err := fmt.Sscanf(intervalStr, "%d", &interval); err == nil {
+			config.CheckInterval = interval
+		}
+	}
+	if maxIssuesStr := os.Getenv("MAX_ISSUES_PER_REPO"); maxIssuesStr != "" {
+		var maxIssues int
+		if _, err := fmt.Sscanf(maxIssuesStr, "%d", &maxIssues); err == nil {
+			config.MaxIssuesPerRepo = maxIssues
+		}
+	}
+	if maxRecommendationsStr := os.Getenv("MAX_RECOMMENDATIONS"); maxRecommendationsStr != "" {
+		var recommendations int
+		if _, err := fmt.Sscanf(maxRecommendationsStr, "%d", &recommendations); err == nil {
+			config.MaxRecommendations = recommendations
+		}
+	}
+	if maxPerProjectStr := os.Getenv("MAX_PER_PROJECT"); maxPerProjectStr != "" {
+		var maxProjectRecommendations int
+		if _, err := fmt.Sscanf(maxPerProjectStr, "%d", &maxProjectRecommendations); err == nil {
+			config.MaxPerProject = maxProjectRecommendations
+		}
+	}
+	if maxPerPriorityStr := os.Getenv("MAX_PER_PRIORITY"); maxPerPriorityStr != "" {
+		var maxPriorityRecommendations int
+		if _, err := fmt.Sscanf(maxPerPriorityStr, "%d", &maxPriorityRecommendations); err == nil {
+			config.MaxPerPriority = maxPriorityRecommendations
+		}
+	}
+	if verboseSkipsStr := os.Getenv("VERBOSE_SKIPS"); verboseSkipsStr != "" {
+		if parsed, err := strconv.ParseBool(verboseSkipsStr); err == nil {
+			config.VerboseSkips = parsed
+		}
+	}
+	if verifyLinkedPRsStr := os.Getenv("VERIFY_LINKED_PRS"); verifyLinkedPRsStr != "" {
+		if parsed, err := strconv.ParseBool(verifyLinkedPRsStr); err == nil {
+			config.VerifyLinkedPRs = parsed
+		}
 	}
 
-	if config.TelegramBotToken == "" {
-		log.Fatal("TELEGRAM_BOT_TOKEN environment variable is required")
+	if config.CheckInterval == 0 {
+		config.CheckInterval = 3600
+	}
+	if config.MaxIssuesPerRepo == 0 {
+		config.MaxIssuesPerRepo = 30
+	}
+	if config.MaxRecommendations == 0 {
+		config.MaxRecommendations = 10
+	}
+	if config.MaxPerProject == 0 {
+		config.MaxPerProject = 2
+	}
+	if config.MaxPerPriority == 0 {
+		config.MaxPerPriority = 4
+	}
+
+	if config.LogDir != "" {
+		if err := os.MkdirAll(config.LogDir, 0755); err != nil {
+			log.Printf("Warning: failed to create log directory: %v", err)
+		} else {
+			logPath := filepath.Join(config.LogDir, "issues.log")
+			file, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err != nil {
+				log.Printf("Warning: failed to open log file: %v", err)
+			} else {
+				logFile = file
+				log.SetOutput(io.MultiWriter(os.Stdout, file))
+			}
+		}
 	}
 
 	finder, err := NewIssueFinder(config)
 	if err != nil {
 		log.Fatalf("Failed to create IssueFinder: %v", err)
 	}
-	defer finder.db.Close()
+	defer func() {
+		if finder.db != nil {
+			finder.db.Close()
+		}
+		if logFile != nil {
+			logFile.Close()
+		}
+	}()
+
+	finder.projects = finder.projects[:min(config.MaxProjects, len(finder.projects))]
+
+	if *once {
+		runOnce(context.Background(), finder)
+		return
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1151,9 +1967,9 @@ func main() {
 
 				if len(issues) > 0 {
 					if err := finder.SendTelegramAlert(issues); err != nil {
-						log.Printf("Error sending Telegram alert: %v", err)
+						log.Printf("Error sending alert: %v", err)
 					} else {
-						log.Printf("Successfully sent Telegram alert for %d issues", len(issues))
+						log.Printf("Successfully output %d issues", len(issues))
 					}
 				} else {
 					log.Println("No new issues found")
@@ -1164,4 +1980,27 @@ func main() {
 
 	<-ctx.Done()
 	log.Println("Shutdown complete")
+}
+
+func runOnce(ctx context.Context, finder *IssueFinder) {
+	log.Println("Running single issue check...")
+	log.Printf("Checking %d projects for good learning issues", len(finder.projects))
+
+	issues, err := finder.FindIssues(ctx)
+	if err != nil {
+		log.Printf("Error finding issues: %v", err)
+		os.Exit(1)
+	}
+
+	log.Printf("Found %d new issues", len(issues))
+
+	if len(issues) == 0 {
+		log.Println("No new issues found")
+		return
+	}
+
+	if err := finder.outputToConsole(issues); err != nil {
+		log.Printf("Error outputting issues: %v", err)
+		os.Exit(1)
+	}
 }

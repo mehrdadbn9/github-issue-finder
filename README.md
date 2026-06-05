@@ -43,9 +43,8 @@ A Telegram bot that finds and alerts you about good learning opportunities (issu
 ### Prerequisites
 
 1. Go 1.21 or higher
-2. PostgreSQL database
-3. GitHub Personal Access Token
-4. Telegram Bot Token
+2. PostgreSQL database (optional - runs in memory-only mode without it)
+3. Telegram Bot Token (optional - runs in console-only mode without it)
 
 ### Installation
 
@@ -78,12 +77,18 @@ go run main.go
 
 ### Environment Variables
 
-- `GITHUB_TOKEN`: Your GitHub Personal Access Token (required)
-- `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token (required)
+- `GITHUB_TOKEN`: Your GitHub Personal Access Token (optional - unauthenticated requests are rate-limited to 60 req/hr)
+- `GITHUB_USERNAME`: Your GitHub username (optional; detected from `GITHUB_TOKEN` when possible, used to allow issues assigned to you)
+- `TELEGRAM_BOT_TOKEN`: Your Telegram Bot Token (optional - runs in console-only mode without it)
 - `TELEGRAM_CHAT_ID`: Your Telegram Chat ID (default: 683539779)
-- `DB_CONNECTION_STRING`: PostgreSQL connection string (default: localhost postgres/postgres)
+- `DB_CONNECTION_STRING`: PostgreSQL connection string (optional - runs in memory-only mode without it)
 - `CHECK_INTERVAL`: Check interval in seconds (default: 3600)
-- `MAX_ISSUES_PER_REPO`: Max issues to fetch per repo (default: 10)
+- `MAX_ISSUES_PER_REPO`: Max issues to fetch per repo (default: 30)
+- `MAX_RECOMMENDATIONS`: Max recommendations to output per run (default: 10)
+- `MAX_PER_PROJECT`: Max recommendations from one project per run (default: 2)
+- `MAX_PER_PRIORITY`: Max recommendations from one priority tier per run (default: 4)
+- `VERIFY_LINKED_PRS`: Verify timeline cross-references and skip issues that already have an open linked PR (default: true)
+- `VERBOSE_SKIPS`: Log every skipped issue and reason (default: false)
 
 ### Getting Telegram Bot Token
 
@@ -99,11 +104,15 @@ go run main.go
 ## Issue Scoring
 
 Issues are scored based on:
-- **Stars Factor (15%)**: Higher star count = higher score
-- **Comments Factor (20%)**: Fewer comments = higher score (less competition)
-- **Recency Factor (20%)**: More recent = higher score
+- **Project Priority Factor (25%)**: KEDA/focus repos, Kubernetes/CNCF core, Kafka/messaging, monitoring/observability, Ansible, then lower-priority projects
+- **Stars Factor (5%)**: Higher star count = small quality signal
+- **Comments Factor (15%)**: Fewer comments = higher score (less competition)
+- **Recency Factor (15%)**: More recent = higher score
 - **Labels Factor (25%)**: "good first issue", "help wanted" = higher score
-- **Difficulty Factor (20%)**: Easier issues = higher score
+- **Difficulty Factor (15%)**: Easier issues = higher score
+
+The finder skips pull requests, assigned-to-others issues, locked issues, stale/duplicate/support/discussion labels, docs-only items, open issues that already have PRs or linked PR timeline references, and maintenance notices such as dependency dashboards or EOL announcements.
+Recommendations are capped per project and per priority tier by default so one large repository or category cannot fill the entire alert.
 
 Score ranges:
 - 🔥 0.8+: Excellent learning opportunity
