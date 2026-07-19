@@ -1,6 +1,7 @@
 # Binaries
 github-issue-finder
 github-issue-finder.exe
+finder-cli
 
 # Test binary, built with `go test -c`
 *.test

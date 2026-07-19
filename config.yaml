@@ -1,6 +1,6 @@
 auto_finder:
   enabled: true
-  auto_comment: true
+  auto_comment: false  # cron scans must NEVER auto-post (anti-spam rule, doc 02)
   max_comments_per_day: 3
   max_comments_per_repo: 1
   min_score_to_comment: 0.75
@@ -35,45 +35,39 @@ smart_limits:
 
 repos:
   included:
-    - owner: kubernetes-sigs
-      name: kubespray
-      category: kubernetes
+    # Standing scan targets — sre-master-plan doc 04, user-confirmed 2026-07-17
+    - owner: VictoriaMetrics
+      name: VictoriaMetrics
+      category: monitoring
       priority: 1
-    - owner: cilium
-      name: cilium
-      category: networking
+    - owner: VictoriaMetrics
+      name: operator
+      category: monitoring
       priority: 1
-    - owner: kyverno
-      name: kyverno
-      category: security
+    - owner: slok
+      name: sloth
+      category: monitoring
+      priority: 1
+    - owner: strimzi
+      name: strimzi-kafka-operator
+      category: kafka
+      priority: 2
+    - owner: rabbitmq
+      name: cluster-operator
+      category: messaging
+      priority: 2
+    - owner: argoproj
+      name: argo-cd
+      category: gitops
       priority: 1
     - owner: kubernetes
       name: kubernetes
       category: kubernetes
-      priority: 2
-    - owner: prometheus
-      name: prometheus
-      category: monitoring
-      priority: 2
+      priority: 3
     - owner: etcd-io
       name: etcd
-      category: storage
-      priority: 2
-    - owner: argoproj
-      name: argo-cd
-      category: ci-cd
-      priority: 2
-    - owner: helm
-      name: helm
       category: kubernetes
-      priority: 2
-  
-  excluded_patterns:
-    - "aws/*"
-    - "GoogleCloudPlatform/*"
-    - "Azure/*"
-    - "googleapis/*"
-
+      priority: 3
 scoring:
   stars_weight: 0.15
   bug_severity_weight: 0.15
