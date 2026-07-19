@@ -218,12 +218,121 @@ func (f *QualifiedIssueFinder) findQualifiedIssuesForProject(ctx context.Context
 		}
 
 		qualified := f.evaluateIssue(issue, project)
-		if qualified != nil && qualified.QualifiedScore.TotalScore >= minScore {
-			qualifiedIssues = append(qualifiedIssues, *qualified)
+		if qualified == nil || qualified.QualifiedScore.TotalScore < minScore {
+			continue
 		}
+
+		// Availability (hard gate): a linked PR — open, or recently closed
+		// unmerged — means the issue is already being worked or is contested.
+		// Only checked for issues that already passed the cheap gates and the
+		// score threshold, so the extra timeline API call runs on survivors only.
+		if blocked, reason := f.linkedPRBlocksAvailability(ctx, project, issue.GetNumber()); blocked {
+			log.Printf("skipping %s/%s#%d (not available): %s", project.Org, project.Name, issue.GetNumber(), reason)
+			continue
+		}
+
+		qualifiedIssues = append(qualifiedIssues, *qualified)
 	}
 
 	return qualifiedIssues
+}
+
+// staleAttemptWindow bounds how recently a closed, unmerged linked PR still
+// signals a contested issue. Older closed attempts are treated as water under the
+// bridge and do not block availability.
+const staleAttemptWindow = 60 * 24 * time.Hour
+
+// linkedPRBlocksAvailability reports whether a timeline-linked PR means the issue
+// is not cleanly available to claim, and why. Two blocking signals, both drawn
+// from a single timeline call:
+//   - an OPEN linked PR — someone is actively working it;
+//   - a recently CLOSED, unmerged linked PR — a stalled or contested attempt a
+//     human should review before re-claiming (may be reopened, blocked, or
+//     superseded by a duplicate; e.g. kedacore/keda#7691, whose only direct link
+//     #7713 closed unmerged and whose canonical fix #7700 is only reachable two
+//     hops away and so never surfaces here).
+//
+// Merged PRs and old closed attempts (> staleAttemptWindow) do not block. On API
+// error we fail open — better to surface a maybe-taken issue than silently drop a
+// good one on a flaky call. This replaces the old scoreNoOpenPR signal, which
+// inspected issue.PullRequestLinks (nil for a normal issue — it only says whether
+// the issue itself is a PR, never whether a PR is linked to it).
+func (f *QualifiedIssueFinder) linkedPRBlocksAvailability(ctx context.Context, project Project, number int) (bool, string) {
+	var events []*github.Timeline
+	err := f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("timeline %s/%s#%d", project.Org, project.Name, number), func() (*github.Response, error) {
+		var apiErr error
+		events, _, apiErr = f.client.Issues.ListIssueTimeline(ctx, project.Org, project.Name, number, &github.ListOptions{PerPage: 100})
+		return nil, apiErr
+	})
+	if err != nil {
+		log.Printf("timeline check failed for %s/%s#%d: %v", project.Org, project.Name, number, err)
+		return false, ""
+	}
+
+	// Collect linked PRs from the timeline (I/O), then hand the pure decision to
+	// linkedPRVerdict. The timeline's typed Issue does not expose merge status, so
+	// closed linked PRs need one light PR fetch to fill Merged/ClosedAt (rare path).
+	var prs []linkedPR
+	for _, e := range events {
+		if e.GetEvent() != "cross-referenced" || e.Source == nil || e.Source.Issue == nil {
+			continue
+		}
+		ref := e.Source.Issue
+		if !ref.IsPullRequest() {
+			continue
+		}
+		lp := linkedPR{Number: ref.GetNumber(), State: ref.GetState()}
+		if lp.State != "open" {
+			pr := f.getPR(ctx, project, lp.Number)
+			if pr == nil {
+				continue // couldn't resolve — fail open, skip this one
+			}
+			lp.Merged = pr.GetMerged()
+			lp.ClosedAt = pr.GetClosedAt().Time
+		}
+		prs = append(prs, lp)
+	}
+	return linkedPRVerdict(prs, time.Now())
+}
+
+// linkedPR is a timeline-linked pull request reduced to the fields the
+// availability decision needs.
+type linkedPR struct {
+	Number   int
+	State    string // "open" or "closed"
+	Merged   bool
+	ClosedAt time.Time
+}
+
+// linkedPRVerdict is the pure availability decision over a set of linked PRs: an
+// open PR means the issue is taken; a recently closed, unmerged PR means a
+// stalled/contested attempt worth a human look. Merged PRs and old closed
+// attempts do not block. Kept free of I/O so it is exhaustively unit-testable.
+func linkedPRVerdict(prs []linkedPR, now time.Time) (bool, string) {
+	for _, pr := range prs {
+		if pr.State == "open" {
+			return true, fmt.Sprintf("open linked PR #%d", pr.Number)
+		}
+		if !pr.Merged && now.Sub(pr.ClosedAt) < staleAttemptWindow {
+			return true, fmt.Sprintf("recent stalled PR #%d (closed unmerged %s)", pr.Number, pr.ClosedAt.Format("2006-01-02"))
+		}
+	}
+	return false, ""
+}
+
+// getPR fetches a single pull request, returning nil on error (fail open).
+func (f *QualifiedIssueFinder) getPR(ctx context.Context, project Project, number int) *github.PullRequest {
+	var pr *github.PullRequest
+	err := f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("pr %s/%s#%d", project.Org, project.Name, number), func() (*github.Response, error) {
+		var apiErr error
+		pr, _, apiErr = f.client.PullRequests.Get(ctx, project.Org, project.Name, number)
+		return nil, apiErr
+	})
+	if err != nil {
+		log.Printf("pr fetch failed for %s/%s#%d: %v", project.Org, project.Name, number, err)
+		return nil
+	}
+	return pr
 }
 
 func (f *QualifiedIssueFinder) evaluateIssue(issue *github.Issue, project Project) *QualifiedIssue {
@@ -234,6 +343,13 @@ func (f *QualifiedIssueFinder) evaluateIssue(issue *github.Issue, project Projec
 	}
 
 	if f.hasExcludedLabels(labels) {
+		return nil
+	}
+
+	// A "help wanted" (or "good first issue") label does not make a support
+	// question actionable. Veto on content so the qualifier never surfaces a
+	// thread with no concrete deliverable, even when the label set looks good.
+	if f.looksLikeQuestion(issue) {
 		return nil
 	}
 
@@ -453,6 +569,69 @@ func (f *QualifiedIssueFinder) hasExcludedLabels(labels []string) bool {
 			}
 		}
 	}
+	return false
+}
+
+// looksLikeQuestion reports whether an issue is really a question or support
+// request rather than actionable work. Maintainers sometimes tag open-ended
+// questions with "help wanted"/"good first issue", so a good label set is not
+// enough — we classify on the title and body. Two tiers keep false positives
+// low: strong phrases veto on a single hit, soft phrases only when they pile up
+// or the title is itself a question with no actionable signal (no repro, no
+// code block, no checklist).
+func (f *QualifiedIssueFinder) looksLikeQuestion(issue *github.Issue) bool {
+	title := strings.ToLower(strings.TrimSpace(issue.GetTitle()))
+	body := strings.ToLower(issue.GetBody())
+
+	// Title openers that almost always signal a question, not a task.
+	for _, p := range []string{
+		"how do", "how to", "how can", "how should", "how does",
+		"why does", "why is", "why do", "what is", "what does",
+		"is it possible", "is there a way", "is there any",
+		"can i ", "can we ", "do i need", "does anyone", "should i",
+		"question about", "question:", "help with",
+	} {
+		if strings.HasPrefix(title, p) {
+			return true
+		}
+	}
+
+	// Strong body phrases: a single occurrence is enough to veto.
+	for _, p := range []string{
+		"how do i", "how can i", "how should i", "is it possible to",
+		"my question is", "just a question", "support request",
+		"can someone explain", "am i doing something wrong",
+		"is this a bug or", "not sure if this is a bug",
+	} {
+		if strings.Contains(body, p) {
+			return true
+		}
+	}
+
+	// Soft body phrases: only veto when two or more pile up.
+	soft := 0
+	for _, p := range []string{
+		"is there a way", "any idea", "any help", "please help",
+		"need help", "am i missing", "expected behavior?", "am i wrong",
+	} {
+		if strings.Contains(body, p) {
+			soft++
+		}
+	}
+	if soft >= 2 {
+		return true
+	}
+
+	// Title phrased as a question with no actionable signal in the body. A "?"
+	// title that ships repro steps or a code block is usually a real bug report,
+	// so those are kept.
+	if strings.HasSuffix(title, "?") &&
+		!strings.Contains(body, "```") &&
+		!f.hasClearReproduction(issue) &&
+		!f.hasAcceptanceCriteria(issue) {
+		return true
+	}
+
 	return false
 }
 
