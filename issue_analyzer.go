@@ -425,7 +425,7 @@ func ParseIssueURL(url string) (owner, repo string, number int, err error) {
 
 func parseNumber(s string) int {
 	var n int
-	fmt.Sscanf(s, "%d", &n)
+	_, _ = fmt.Sscanf(s, "%d", &n)
 	return n
 }
 

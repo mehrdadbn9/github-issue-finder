@@ -74,6 +74,7 @@ func TestMCPServer_HandleReposResource(t *testing.T) {
 
 	if result == nil {
 		t.Error("result should not be nil")
+		return
 	}
 
 	if len(result.Contents) == 0 {

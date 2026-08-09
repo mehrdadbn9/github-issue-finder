@@ -57,7 +57,6 @@ type QualifiedIssueFinder struct {
 	filter      *QualifiedIssueFilter
 	projects    []Project
 	seenIssues  map[string]bool
-	mu          sync.RWMutex
 }
 
 type QualifiedScorer struct {
@@ -199,9 +198,7 @@ func (f *QualifiedIssueFinder) findQualifiedIssuesForProject(ctx context.Context
 	}
 
 	var issues []*github.Issue
-	var err error
-
-	err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("qualified issues %s/%s", project.Org, project.Name), func() (*github.Response, error) {
+	err := f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("qualified issues %s/%s", project.Org, project.Name), func() (*github.Response, error) {
 		var apiErr error
 		issues, _, apiErr = f.client.Issues.ListByRepo(ctx, project.Org, project.Name, opts)
 		return nil, apiErr

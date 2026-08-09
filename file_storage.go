@@ -90,10 +90,6 @@ func (fs *FileStorage) statusPath() string {
 	return filepath.Join(fs.basePath, "status.json")
 }
 
-func (fs *FileStorage) configPath() string {
-	return filepath.Join(fs.basePath, "config.json")
-}
-
 func (fs *FileStorage) LoadHistory() ([]FileCommentRecord, error) {
 	fs.mu.RLock()
 	defer fs.mu.RUnlock()

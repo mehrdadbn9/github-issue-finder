@@ -66,11 +66,10 @@ func (m *MockIssueTracker) GetActiveCount() (int, error) {
 }
 
 type MockGitHubClient struct {
-	issue    *github.Issue
-	repo     *github.Repository
-	issues   []*github.Issue
-	err      error
-	comments []*github.IssueComment
+	issue  *github.Issue
+	repo   *github.Repository
+	issues []*github.Issue
+	err    error
 }
 
 func (m *MockGitHubClient) GetIssue(ctx context.Context, owner, repo string, number int) (*github.Issue, *github.Response, error) {
@@ -113,24 +112,6 @@ func createTestIssue() Issue {
 			Stars:    5000,
 			Category: "test-category",
 		},
-	}
-}
-
-func createTestGitHubIssue() *github.Issue {
-	return &github.Issue{
-		Title:     github.String("Test GitHub Issue"),
-		Body:      github.String("Test body with func testFunction() and file main.go"),
-		Number:    github.Int(123),
-		HTMLURL:   github.String("https://github.com/owner/repo/issues/123"),
-		State:     github.String("open"),
-		Comments:  github.Int(2),
-		CreatedAt: &github.Timestamp{Time: time.Now().Add(-24 * time.Hour)},
-		Labels: []*github.Label{
-			{Name: github.String("bug")},
-			{Name: github.String("good first issue")},
-		},
-		User:      &github.User{Login: github.String("testuser")},
-		Assignees: []*github.User{},
 	}
 }
 
@@ -764,7 +745,7 @@ func TestMCPServer_HandleGetStats(t *testing.T) {
 			if result != nil && len(result.Content) > 0 {
 				if textContent, ok := result.Content[0].(*mcp.TextContent); ok {
 					var stats map[string]interface{}
-					json.Unmarshal([]byte(textContent.Text), &stats)
+					_ = json.Unmarshal([]byte(textContent.Text), &stats)
 					if stats["period"] != tt.args.Period && tt.args.Period != "" {
 						t.Errorf("period mismatch: got %v, want %v", stats["period"], tt.args.Period)
 					}
@@ -937,21 +918,6 @@ func TestMCPGetRecommendation(t *testing.T) {
 }
 
 func TestNewMCPServer(t *testing.T) {
-	t.Run("config load error simulation", func(t *testing.T) {
-		server := &MCPServer{
-			finder:      nil,
-			tracker:     nil,
-			commentGen:  NewSmartCommentGenerator(),
-			repoManager: NewRepoManager(),
-			client:      nil,
-			db:          nil,
-			config:      nil,
-		}
-
-		if server == nil {
-			t.Error("server should not be nil")
-		}
-	})
 
 	t.Run("config validation error simulation", func(t *testing.T) {
 		cfg := &Config{GitHubToken: ""}

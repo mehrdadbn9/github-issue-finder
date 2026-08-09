@@ -42,7 +42,6 @@ type AssignmentManager struct {
 	db            *sql.DB
 	username      string
 	spamManager   *AssignmentSpamManager
-	mu            sync.RWMutex
 	maxDailyLimit int
 	enabled       bool
 	autoMode      bool
@@ -222,7 +221,7 @@ type AssignmentCandidate struct {
 }
 
 func (m *AssignmentManager) IsAssignmentCandidate(issue *github.Issue, org, repo string) (*AssignmentCandidate, bool) {
-	if issue == nil || issue.Assignees != nil && len(issue.Assignees) > 0 {
+	if issue == nil || len(issue.Assignees) > 0 {
 		return nil, false
 	}
 

@@ -80,15 +80,15 @@ func (n *LocalNotifier) logToFile(message string) {
 	if n.logFile != nil {
 		timestamp := time.Now().Format("2006-01-02 15:04:05")
 		logEntry := fmt.Sprintf("[%s] %s\n", timestamp, message)
-		n.logFile.WriteString(logEntry)
+		_, _ = n.logFile.WriteString(logEntry)
 	}
 }
 
 func (n *LocalNotifier) logToNotificationsFile(title, url string, score float64, priority string) {
 	if n.notificationsFile != nil {
 		notification := fmt.Sprintf("%s|%s|%.2f|%s\n", title, url, score, priority)
-		n.notificationsFile.WriteString(notification)
-		n.notificationsFile.Sync()
+		_, _ = n.notificationsFile.WriteString(notification)
+		_ = n.notificationsFile.Sync()
 	}
 }
 

@@ -19,7 +19,6 @@ type IssueMonitor struct {
 	client    *github.Client
 	notifier  *LocalNotifier
 	storage   *MonitorStorage
-	limiter   *SmartLimiter
 	scorer    *IssueScorer
 	mu        sync.RWMutex
 	running   bool
@@ -259,7 +258,7 @@ func (s *MonitorStorage) ClearOld(maxAge time.Duration) {
 	cutoff := time.Now().Add(-maxAge)
 	_ = cutoff
 
-	s.save()
+	_ = s.save()
 }
 
 func NewIssueMonitor(config *MonitorConfig, client *github.Client, notifier *LocalNotifier, fileStore *FileStorage) (*IssueMonitor, error) {
@@ -376,7 +375,7 @@ func (m *IssueMonitor) check(ctx context.Context) []FoundIssue {
 				newIssues = append(newIssues, found)
 				mu.Unlock()
 
-				m.storage.MarkSeen(repoKey, issue.GetNumber())
+				_ = m.storage.MarkSeen(repoKey, issue.GetNumber())
 			}
 		}(repo)
 	}
@@ -456,7 +455,7 @@ func (m *IssueMonitor) notify(issues []FoundIssue) {
 	}
 
 	if m.config.NotifyEmail && m.notifier != nil {
-		m.notifyEmail(issues)
+		_ = m.notifyEmail(issues)
 	}
 
 	m.logNotification(issues)
@@ -563,7 +562,7 @@ func formatLabelsHTML(labels []string) string {
 
 func (m *IssueMonitor) logNotification(issues []FoundIssue) {
 	logDir := filepath.Join(".", "logs")
-	os.MkdirAll(logDir, 0755)
+	_ = os.MkdirAll(logDir, 0755)
 
 	f, err := os.OpenFile(filepath.Join(logDir, "notifications.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {

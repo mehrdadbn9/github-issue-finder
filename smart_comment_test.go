@@ -70,7 +70,7 @@ func TestValidateIssueDetails(t *testing.T) {
 
 func TestCheckIfIssueHasSolution(t *testing.T) {
 	generator := NewSmartCommentGenerator()
-	
+
 	tests := []struct {
 		name      string
 		issueBody string
@@ -124,7 +124,7 @@ func TestCheckIfIssueHasSolution(t *testing.T) {
 
 func TestGenerateSmartCommentWithSolution(t *testing.T) {
 	generator := NewSmartCommentGenerator()
-	
+
 	// Test that GenerateSmartComment returns error when solution exists
 	details := IssueDetails{
 		Title:        "Bug Report",
@@ -135,7 +135,7 @@ func TestGenerateSmartCommentWithSolution(t *testing.T) {
 		ProjectName:  "test",
 		CreatedAt:    time.Now(),
 	}
-	
+
 	comment, err := generator.GenerateSmartComment(details)
 	if err == nil {
 		t.Errorf("GenerateSmartComment() expected error for issue with solution, got %v", comment)

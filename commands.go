@@ -542,7 +542,7 @@ func runNotifyCommand(ctx context.Context, finder *IssueFinder, spamManager *Not
 
 	if sendLocal {
 		for _, issue := range filtered {
-			spamManager.RecordNotification(issue.Project.Name, issue.URL, issue.Number)
+			_ = spamManager.RecordNotification(issue.Project.Name, issue.URL, issue.Number)
 		}
 	}
 
@@ -966,7 +966,7 @@ func runCommitCommand(ctx context.Context, finder *IssueFinder) error {
 	fmt.Print("Proceed? (y/N): ")
 
 	var response string
-	fmt.Scanln(&response)
+	_, _ = fmt.Scanln(&response)
 	if strings.ToLower(response) != "y" {
 		fmt.Println("Aborted.")
 		return nil
@@ -1066,133 +1066,6 @@ func ParseIssueNumberFromURL(url string) (string, string, int, error) {
 	}
 
 	return org, repo, number, nil
-}
-
-func runMonitorCommand(ctx context.Context, finder *IssueFinder, args []string) error {
-	if len(args) == 0 {
-		PrintMonitorUsage()
-		return nil
-	}
-
-	subCmd := args[0]
-	switch subCmd {
-	case "start":
-		return runStartMonitorCommand(ctx, finder)
-	case "stop":
-		return runStopMonitorCommand(finder)
-	case "status":
-		return runMonitorStatusCommand(finder)
-	case "check":
-		return runMonitorCheckCommand(ctx, finder)
-	case "notify":
-		return runMonitorNotifyCommand(finder)
-	default:
-		return fmt.Errorf("unknown monitor subcommand: %s", subCmd)
-	}
-}
-
-func runStartMonitorCommand(ctx context.Context, finder *IssueFinder) error {
-	if finder == nil {
-		return fmt.Errorf("finder not initialized")
-	}
-
-	monitorConfig := DefaultMonitorConfig()
-	monitor, err := NewIssueMonitor(monitorConfig, finder.client, finder.notifier, finder.fileStore)
-	if err != nil {
-		return fmt.Errorf("failed to create monitor: %w", err)
-	}
-
-	fmt.Println("\n🔍 Starting Issue Monitor...")
-	fmt.Printf("   Check interval: %v\n", monitorConfig.CheckInterval)
-	fmt.Printf("   Repositories: %d\n", len(monitorConfig.Repos))
-	fmt.Printf("   Min score: %.2f\n", monitorConfig.MinScore)
-	fmt.Printf("   Notifications: Local=%v, Email=%v\n", monitorConfig.NotifyLocal, monitorConfig.NotifyEmail)
-	fmt.Println("\nPress Ctrl+C to stop...")
-
-	return monitor.Start(ctx)
-}
-
-func runStopMonitorCommand(finder *IssueFinder) error {
-	fmt.Println("Monitor stop signal sent (no persistent monitor running)")
-	return nil
-}
-
-func runMonitorStatusCommand(finder *IssueFinder) error {
-	fmt.Println("\n📊 MONITOR STATUS")
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Println("   Running: No active daemon")
-	fmt.Println("   Note: Use 'monitor start' to begin monitoring")
-	fmt.Println("\n📋 Default Configuration:")
-	config := DefaultMonitorConfig()
-	fmt.Printf("   Check Interval: %v\n", config.CheckInterval)
-	fmt.Printf("   Min Score: %.2f\n", config.MinScore)
-	fmt.Printf("   Max Issues Per Check: %d\n", config.MaxIssuesPerCheck)
-	fmt.Printf("   Notifications: Local=%v, Email=%v\n", config.NotifyLocal, config.NotifyEmail)
-	fmt.Printf("   Repositories: %d\n", len(config.Repos))
-
-	fmt.Println("\n📁 Monitored Repositories (by category):")
-	categories := make(map[string][]RepoConfig)
-	for _, repo := range config.Repos {
-		categories[repo.Category] = append(categories[repo.Category], repo)
-	}
-	for cat, repos := range categories {
-		fmt.Printf("\n   %s (%d repos):\n", strings.Title(cat), len(repos))
-		for _, r := range repos {
-			fmt.Printf("      - %s/%s (priority: %d)\n", r.Owner, r.Name, r.Priority)
-		}
-	}
-
-	return nil
-}
-
-func runMonitorCheckCommand(ctx context.Context, finder *IssueFinder) error {
-	if finder == nil {
-		return fmt.Errorf("finder not initialized")
-	}
-
-	fmt.Println("\n🔍 Running One-Time Monitor Check...")
-	fmt.Println(strings.Repeat("=", 60))
-
-	monitorConfig := DefaultMonitorConfig()
-	monitor, err := NewIssueMonitor(monitorConfig, finder.client, finder.notifier, finder.fileStore)
-	if err != nil {
-		return fmt.Errorf("failed to create monitor: %w", err)
-	}
-
-	issues, err := monitor.CheckOnce(ctx)
-	if err != nil {
-		return fmt.Errorf("check failed: %w", err)
-	}
-
-	if len(issues) == 0 {
-		fmt.Println("\n✅ Check complete. No new qualifying issues found.")
-	} else {
-		fmt.Printf("\n✅ Check complete. Found %d new qualifying issues.\n", len(issues))
-	}
-
-	return nil
-}
-
-func runMonitorNotifyCommand(finder *IssueFinder) error {
-	if finder == nil {
-		return fmt.Errorf("finder not initialized")
-	}
-
-	fmt.Println("\n🔔 Testing Monitor Notifications...")
-	fmt.Println(strings.Repeat("=", 60))
-
-	monitorConfig := DefaultMonitorConfig()
-	monitor, err := NewIssueMonitor(monitorConfig, finder.client, finder.notifier, finder.fileStore)
-	if err != nil {
-		return fmt.Errorf("failed to create monitor: %w", err)
-	}
-
-	if err := monitor.TestNotification(); err != nil {
-		return fmt.Errorf("notification test failed: %w", err)
-	}
-
-	fmt.Println("\n✅ Test notification sent successfully!")
-	return nil
 }
 
 func PrintMonitorUsage() {

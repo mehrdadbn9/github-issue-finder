@@ -32,6 +32,7 @@ func TestNewMCPClient(t *testing.T) {
 
 			if client == nil {
 				t.Error("NewMCPClient should return non-nil client")
+				return
 			}
 
 			if client.connections == nil {
@@ -50,6 +51,7 @@ func TestDefaultMCPRuntimeClientConfig(t *testing.T) {
 
 	if config == nil {
 		t.Error("DefaultMCPRuntimeClientConfig should return non-nil config")
+		return
 	}
 
 	if config.DefaultTimeout != 30*time.Second {
@@ -346,6 +348,7 @@ func TestMCPClient_GetConfig(t *testing.T) {
 
 	if returnedConfig == nil {
 		t.Error("GetConfig should return non-nil config")
+		return
 	}
 
 	if returnedConfig.DefaultTimeout != 45*time.Second {

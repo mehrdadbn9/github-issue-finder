@@ -18,19 +18,6 @@ type ContributionPolicy struct {
 	trustedRepos     map[string]*RepoStats
 	commentCooldown  time.Duration
 	newRepoThreshold int
-	openPRRepos      map[string]bool
-}
-
-var defaultAvoidRepos = map[string]bool{
-	"golang/go":         true,
-	"grafana/grafana":   true,
-	"keycloak/keycloak": true,
-	"caddyserver/caddy": true,
-}
-
-var userOpenPRRepos = map[string]bool{
-	"VictoriaMetrics/VictoriaMetrics": true,
-	"prometheus/alertmanager":         true,
 }
 
 type RepoStats struct {
@@ -125,7 +112,7 @@ func NewContributionPolicy(client *github.Client, db *sqlx.DB, username string) 
 		commentCooldown:  24 * time.Hour,
 		newRepoThreshold: 1,
 	}
-	cp.initTables()
+	_ = cp.initTables()
 	cp.loadTrustLevels()
 	return cp
 }

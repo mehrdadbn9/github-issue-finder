@@ -521,6 +521,7 @@ func TestAICommentGenerator_New(t *testing.T) {
 
 	if generator == nil {
 		t.Error("NewAICommentGenerator should return non-nil generator")
+		return
 	}
 
 	if !generator.aiPreferred {

@@ -12,7 +12,7 @@ type Config struct {
 	GitHubToken        string
 	TelegramBotToken   string
 	TelegramChatID     int64
-	TelegramChatIDs    []int64  // multi-target: group + private chat
+	TelegramChatIDs    []int64 // multi-target: group + private chat
 	CheckInterval      int
 	MaxIssuesPerRepo   int
 	MaxProjects        int

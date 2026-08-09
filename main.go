@@ -143,7 +143,7 @@ func (r *RateLimiter) WaitIfNeeded(ctx context.Context) error {
 }
 
 func (r *RateLimiter) checkRateLimit(ctx context.Context) error {
-	rateLimit, _, err := r.client.RateLimits(ctx)
+	rateLimit, _, err := r.client.RateLimit.Get(ctx)
 	if err != nil {
 		log.Printf("[Rate Limit] Failed to fetch rate limits: %v", err)
 		return err
@@ -1676,9 +1676,7 @@ func (f *IssueFinder) FindIssues(ctx context.Context) ([]Issue, error) {
 				log.Printf("Checking issues for %s/%s (%d stars)", p.Org, p.Name, p.Stars)
 
 				var issues []*github.Issue
-				var err error
-
-				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+				err := f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
 					opts := &github.IssueListByRepoOptions{
 						State:     "open",
 						Sort:      "created",
@@ -1840,9 +1838,7 @@ func (f *IssueFinder) FindGoodFirstIssues(ctx context.Context, categories []stri
 				defer projectWg.Done()
 
 				var issues []*github.Issue
-				var err error
-
-				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch good first issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+				err := f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch good first issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
 					opts := &github.IssueListByRepoOptions{
 						State:     "open",
 						Sort:      "created",
@@ -2081,9 +2077,7 @@ func (f *IssueFinder) FindActionableIssues(ctx context.Context) ([]Issue, error)
 				defer projectWg.Done()
 
 				var issues []*github.Issue
-				var err error
-
-				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+				err := f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
 					opts := &github.IssueListByRepoOptions{
 						State:     "open",
 						Sort:      "created",
@@ -2412,9 +2406,7 @@ func (f *IssueFinder) FindGoUpgradeIssues(ctx context.Context) ([]Issue, error) 
 				defer projectWg.Done()
 
 				var issues []*github.Issue
-				var err error
-
-				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+				err := f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch issues for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
 					opts := &github.IssueListByRepoOptions{
 						State:     "open",
 						Sort:      "created",
@@ -2600,9 +2592,7 @@ func (f *IssueFinder) FindConfirmedGoodFirstIssues(ctx context.Context, targetRe
 				defer projectWg.Done()
 
 				var issues []*github.Issue
-				var err error
-
-				err = f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch confirmed GFI for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
+				err := f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("fetch confirmed GFI for %s/%s", p.Org, p.Name), func() (*github.Response, error) {
 					opts := &github.IssueListByRepoOptions{
 						State:     "open",
 						Sort:      "created",
@@ -3371,7 +3361,7 @@ func runMonitorStatusOnly() error {
 		categories[repo.Category] = append(categories[repo.Category], repo)
 	}
 	for cat, repos := range categories {
-		fmt.Printf("\n   %s (%d repos):\n", strings.Title(cat), len(repos))
+		fmt.Printf("\n   %s (%d repos):\n", titleCase(cat), len(repos))
 		for _, r := range repos {
 			fmt.Printf("      - %s/%s (priority: %d)\n", r.Owner, r.Name, r.Priority)
 		}
@@ -3428,7 +3418,7 @@ func main() {
 		subCmd := args[0]
 		switch subCmd {
 		case "status":
-			runMonitorStatusOnly()
+			_ = runMonitorStatusOnly()
 		case "start":
 			fmt.Println("Start command requires a running service. Use 'monitor check' for one-time check.")
 		case "stop":
@@ -3885,7 +3875,7 @@ func main() {
 					if request != nil {
 						log.Printf("Assignment status for %s#%d: %s", issue.Project.Name, issue.Number, request.Status)
 						if finder.tracker != nil {
-							finder.tracker.MarkAssignmentAsked(issue.URL)
+							_ = finder.tracker.MarkAssignmentAsked(issue.URL)
 						}
 					}
 				}

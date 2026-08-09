@@ -452,9 +452,9 @@ func QualifiedIssueEmailTemplate(issue QualifiedIssue) *EmailTemplate {
 	</div>
 </body>
 </html>
-	`, scoreEmoji, issue.Title, issue.QualifiedScore.TotalScore, strings.Title(string(issue.Type)),
+	`, scoreEmoji, issue.Title, issue.QualifiedScore.TotalScore, titleCase(string(issue.Type)),
 		issue.Project.Org, issue.Project.Name, formatStars(issue.Project.Stars),
-		strings.Title(string(issue.Type)), issue.Project.Category, issue.Comments,
+		titleCase(string(issue.Type)), issue.Project.Category, issue.Comments,
 		labelsHTML.String(), issue.URL, issue.Project.Org, issue.Project.Name,
 		whyGoodHTML, cloneURL, time.Now().Format("2006"))
 
@@ -477,7 +477,7 @@ Quick Clone: git clone %s
 
 ---
 GitHub Issue Finder • %s
-	`, issue.Title, issue.QualifiedScore.TotalScore, strings.Title(string(issue.Type)),
+	`, issue.Title, issue.QualifiedScore.TotalScore, titleCase(string(issue.Type)),
 		issue.Project.Org, issue.Project.Name, formatStars(issue.Project.Stars),
 		issue.Project.Category, issue.Comments, issue.URL,
 		strings.Join(whyGood, "\n- "), cloneURL, time.Now().Format("2006-01-02"))

@@ -10,7 +10,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/go-github/v58/github"
@@ -29,7 +28,6 @@ type AutoFinder struct {
 	commentQueue []CommentRequest         // Queue of pending comments
 	fileStorage  *FileStorage             // File-based storage when DB unavailable
 	useDB        bool                     // Whether to use database for persistence
-	mu           sync.Mutex               // Mutex for thread-safe operations
 	smartLimiter *SmartLimiter            // Smart rate limiting
 	strategy     *CommentStrategy         // Comment selection strategy
 }
@@ -559,7 +557,7 @@ func (af *AutoFinder) recordComment(issue ScoredIssue, comment string) error {
 		if err != nil {
 			return err
 		}
-		defer tx.Rollback()
+		defer func() { _ = tx.Rollback() }()
 
 		_, err = tx.Exec(`
 			INSERT INTO comment_history (repo, issue_number, issue_url, comment_text, score, commented_at)
@@ -582,11 +580,13 @@ func (af *AutoFinder) recordComment(issue ScoredIssue, comment string) error {
 			return err
 		}
 
-		_, err = tx.Exec(`
+		if _, err = tx.Exec(`
 			INSERT INTO found_issues (repo, issue_number, title, score, status)
 			VALUES ($1, $2, $3, $4, 'commented')
 			ON CONFLICT (repo, issue_number) DO UPDATE SET status = 'commented', score = $4
-		`, issue.Project.Name, issue.Issue.GetNumber(), issue.Issue.GetTitle(), issue.Score.Total)
+		`, issue.Project.Name, issue.Issue.GetNumber(), issue.Issue.GetTitle(), issue.Score.Total); err != nil {
+			return err
+		}
 
 		return tx.Commit()
 	}
@@ -618,17 +618,6 @@ func (af *AutoFinder) recordComment(issue ScoredIssue, comment string) error {
 	}
 
 	return nil
-}
-
-// recordFoundIssue logs an issue as found but not yet commented on.
-// Used to track discovered issues without posting comments.
-func (af *AutoFinder) recordFoundIssue(issue ScoredIssue) error {
-	_, err := af.db.Exec(`
-		INSERT INTO found_issues (repo, issue_number, title, score, status)
-		VALUES ($1, $2, $3, $4, 'found')
-		ON CONFLICT (repo, issue_number) DO UPDATE SET score = $4
-	`, issue.Project.Name, issue.Issue.GetNumber(), issue.Issue.GetTitle(), issue.Score.Total)
-	return err
 }
 
 // sendNotifications logs found issues and sends notifications if configured.
@@ -825,7 +814,7 @@ func getEnvInt(key string, defaultVal int) int {
 		return defaultVal
 	}
 	var result int
-	fmt.Sscanf(val, "%d", &result)
+	_, _ = fmt.Sscanf(val, "%d", &result)
 	if result == 0 {
 		return defaultVal
 	}
@@ -839,7 +828,7 @@ func getEnvFloat(key string, defaultVal float64) float64 {
 		return defaultVal
 	}
 	var result float64
-	fmt.Sscanf(val, "%f", &result)
+	_, _ = fmt.Sscanf(val, "%f", &result)
 	if result == 0 {
 		return defaultVal
 	}

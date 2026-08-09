@@ -8,8 +8,8 @@ import (
 
 func TestLinkedPRVerdict(t *testing.T) {
 	now := time.Date(2026, 7, 19, 0, 0, 0, 0, time.UTC)
-	recent := now.Add(-9 * 24 * time.Hour)  // within staleAttemptWindow (60d)
-	old := now.Add(-120 * 24 * time.Hour)   // outside the window
+	recent := now.Add(-9 * 24 * time.Hour) // within staleAttemptWindow (60d)
+	old := now.Add(-120 * 24 * time.Hour)  // outside the window
 
 	tests := []struct {
 		name       string
@@ -18,9 +18,9 @@ func TestLinkedPRVerdict(t *testing.T) {
 		wantReason string // substring; empty = no reason expected
 	}{
 		{
-			name:       "no linked PRs is available",
-			prs:        nil,
-			wantBlock:  false,
+			name:      "no linked PRs is available",
+			prs:       nil,
+			wantBlock: false,
 		},
 		{
 			name:       "open linked PR blocks (taken)",

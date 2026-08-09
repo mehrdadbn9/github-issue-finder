@@ -90,7 +90,7 @@ func displayQualifiedIssueCard(issue QualifiedIssue, num int) {
 	}
 	fmt.Println()
 
-	fmt.Printf("   📝 Type: %s", strings.Title(string(issue.Type)))
+	fmt.Printf("   📝 Type: %s", titleCase(string(issue.Type)))
 	if len(issue.Labels) > 0 {
 		relevantLabels := filterRelevantLabels(issue.Labels)
 		if len(relevantLabels) > 0 {
@@ -130,18 +130,18 @@ func formatStars(stars int) string {
 	return fmt.Sprintf("%d", stars)
 }
 
-func formatAssignee(hasAssignee bool) string {
-	if hasAssignee {
-		return "Yes"
+func titleCase(s string) string {
+	var b strings.Builder
+	prevLetter := false
+	for _, r := range s {
+		if !prevLetter {
+			b.WriteString(strings.ToUpper(string(r)))
+		} else {
+			b.WriteRune(r)
+		}
+		prevLetter = (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')
 	}
-	return "None"
-}
-
-func formatPR(hasPR bool) string {
-	if hasPR {
-		return "Yes"
-	}
-	return "0"
+	return b.String()
 }
 
 func filterRelevantLabels(labels []string) []string {
