@@ -1,0 +1,6 @@
+# Build-context hygiene: never copy postgres data or secrets into the image
+pgdata/
+.env
+*.log
+.git/
+.gitignore
