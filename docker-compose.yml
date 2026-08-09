@@ -1,17 +1,18 @@
 services:
   # --- Postgres: mandatory (app requires it for anti-spam + trust history) ---
-  db:
+  # Legacy layout: bind mount ./pgdata (excluded from image via .dockerignore),
+  # user/db "issue-finder" — matches the stack that has run since 2026-08-07.
+  postgres:
     image: postgres:16-alpine
-    container_name: issuefinder-db
     restart: unless-stopped
     environment:
-      POSTGRES_USER: issue_finder
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-issue_finder}
-      POSTGRES_DB: issue_finder
+      POSTGRES_USER: issue-finder
+      POSTGRES_PASSWORD: issue-finder-pass
+      POSTGRES_DB: issue-finder
     volumes:
-      - dbdata:/var/lib/postgresql/data
+      - ./pgdata:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U issue_finder"]
+      test: ["CMD-SHELL", "pg_isready -U issue-finder"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -32,14 +33,16 @@ services:
     container_name: issue-finder
     restart: unless-stopped
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
     environment:
       GITHUB_TOKEN: ${GITHUB_TOKEN}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
-      DB_CONNECTION_STRING: "host=db user=issue_finder password=${DB_PASSWORD:-issue_finder} dbname=issue_finder sslmode=disable port=5432"
+      TELEGRAM_CHAT_IDS: ${TELEGRAM_CHAT_IDS}
+      DB_CONNECTION_STRING: "host=postgres user=issue-finder password=issue-finder-pass dbname=issue-finder sslmode=disable port=5432"
       CHECK_INTERVAL: "${CHECK_INTERVAL:-3600}"
+      POLL_INTERVAL: "${POLL_INTERVAL:-300}"
       CONTRIB_POLICY: ${CONTRIB_POLICY:-}
     # Resource caps so it coexists with Jellyfin / other containers
     deploy:
@@ -50,6 +53,3 @@ services:
         reservations:
           cpus: "0.25"
           memory: 128M
-
-volumes:
-  dbdata:
