@@ -59,7 +59,15 @@ func NewLocalNotifier(emailConfig *EmailConfig) (*LocalNotifier, error) {
 	return notifier, nil
 }
 
+// Close is safe to call on a nil notifier. main() logs a failure from
+// NewLocalNotifier and carries on without one, so the deferred Close at the end
+// of main runs on a nil receiver and took the whole process down with
+// "invalid memory address or nil pointer dereference" every time local
+// notification setup failed.
 func (n *LocalNotifier) Close() {
+	if n == nil {
+		return
+	}
 	if n.logFile != nil {
 		n.logFile.Close()
 	}

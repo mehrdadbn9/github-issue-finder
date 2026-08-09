@@ -330,7 +330,13 @@ func (m *AssignmentManager) AskForAssignment(ctx context.Context, candidate *Ass
 		RequestedAt: time.Now(),
 	}
 
-	commentBody := fmt.Sprintf("Hi, I'd like to work on this issue. Could a maintainer please assign it to me? Thank you!")
+	// Deliberately conditional and short. A drive-by "I'd like to work on
+	// this!" on an issue that is already claimed, already has a PR, or has not
+	// been triaged yet is noise, so the wording gives the maintainer an easy
+	// out and makes clear this is not a land grab.
+	commentBody := "Hi, I've read through this and I think I can take it on. " +
+		"If it's still open and nobody has picked it up, could you assign it to me? " +
+		"If it's already spoken for or you'd rather it wait for triage, no problem at all - just leave it and I'll find another one."
 
 	comment, _, err := m.client.Issues.CreateComment(ctx, candidate.ProjectOrg, candidate.ProjectName, candidate.Issue.GetNumber(), &github.IssueComment{
 		Body: github.String(commentBody),

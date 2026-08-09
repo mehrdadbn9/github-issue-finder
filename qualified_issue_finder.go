@@ -258,10 +258,35 @@ const staleAttemptWindow = 60 * 24 * time.Hour
 // inspected issue.PullRequestLinks (nil for a normal issue — it only says whether
 // the issue itself is a PR, never whether a PR is linked to it).
 func (f *QualifiedIssueFinder) linkedPRBlocksAvailability(ctx context.Context, project Project, number int) (bool, string) {
+	return collectLinkedPRs(ctx, project, number,
+		func(cb func() (*github.Response, error)) error {
+			return f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("timeline %s/%s#%d", project.Org, project.Name, number), cb)
+		},
+		f.client,
+		func(n int) *github.PullRequest { return f.getPR(ctx, project, n) },
+	)
+}
+
+// collectLinkedPRs reads an issue's timeline and returns the availability
+// verdict. Shared by both finders: the qualified path uses it during its own
+// gating, and the Telegram alert path uses it right before sending, which is
+// the only place that actually protects the user from a wasted PR.
+//
+// Collect the linked PRs (I/O), then hand the pure decision to
+// linkedPRVerdict. The timeline's typed Issue does not expose merge status, so
+// closed linked PRs need one light PR fetch to fill Merged/ClosedAt (rare path).
+func collectLinkedPRs(
+	ctx context.Context,
+	project Project,
+	number int,
+	withRetry func(func() (*github.Response, error)) error,
+	client *github.Client,
+	getPR func(int) *github.PullRequest,
+) (bool, string) {
 	var events []*github.Timeline
-	err := f.rateLimiter.executeWithRetry(ctx, fmt.Sprintf("timeline %s/%s#%d", project.Org, project.Name, number), func() (*github.Response, error) {
+	err := withRetry(func() (*github.Response, error) {
 		var apiErr error
-		events, _, apiErr = f.client.Issues.ListIssueTimeline(ctx, project.Org, project.Name, number, &github.ListOptions{PerPage: 100})
+		events, _, apiErr = client.Issues.ListIssueTimeline(ctx, project.Org, project.Name, number, &github.ListOptions{PerPage: 100})
 		return nil, apiErr
 	})
 	if err != nil {
@@ -269,9 +294,6 @@ func (f *QualifiedIssueFinder) linkedPRBlocksAvailability(ctx context.Context, p
 		return false, ""
 	}
 
-	// Collect linked PRs from the timeline (I/O), then hand the pure decision to
-	// linkedPRVerdict. The timeline's typed Issue does not expose merge status, so
-	// closed linked PRs need one light PR fetch to fill Merged/ClosedAt (rare path).
 	var prs []linkedPR
 	for _, e := range events {
 		if e.GetEvent() != "cross-referenced" || e.Source == nil || e.Source.Issue == nil {
@@ -283,7 +305,7 @@ func (f *QualifiedIssueFinder) linkedPRBlocksAvailability(ctx context.Context, p
 		}
 		lp := linkedPR{Number: ref.GetNumber(), State: ref.GetState()}
 		if lp.State != "open" {
-			pr := f.getPR(ctx, project, lp.Number)
+			pr := getPR(lp.Number)
 			if pr == nil {
 				continue // couldn't resolve — fail open, skip this one
 			}

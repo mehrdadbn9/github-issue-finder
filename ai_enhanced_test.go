@@ -202,6 +202,7 @@ func TestAIEnhancer_FallbackEnhanceComment(t *testing.T) {
 		Body:         "The HandleRequest function crashes",
 		Labels:       []string{"bug"},
 		Number:       123,
+		URL:          "https://github.com/owner/repo/issues/123",
 		ProjectOwner: "owner",
 		ProjectName:  "repo",
 	}
@@ -549,6 +550,7 @@ func TestAICommentGenerator_GenerateComment(t *testing.T) {
 		Body:         "The HandleRequest function crashes",
 		Labels:       []string{"bug"},
 		Number:       123,
+		URL:          "https://github.com/owner/repo/issues/123",
 		ProjectOwner: "owner",
 		ProjectName:  "repo",
 	}
@@ -578,6 +580,7 @@ func TestAICommentGenerator_GenerateWithAnalysis(t *testing.T) {
 		Body:         "Test body",
 		Labels:       []string{"bug"},
 		Number:       123,
+		URL:          "https://github.com/owner/repo/issues/123",
 		ProjectOwner: "owner",
 		ProjectName:  "repo",
 	}

@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/google/go-github/v58/github"
@@ -335,18 +337,123 @@ func (s *IssueScorer) ScoreIssue(issue *github.Issue, project Project) float64 {
 		score += 0.10
 	}
 
-	// Cloud provider penalty - user uses bare metal
-	cloudKeywords := []string{
-		"gcp", "google cloud", "compute engine", "gke", "cloud sql", "bigquery", "pubsub",
-		"aws", "amazon web", "ec2", "s3 bucket", "lambda", "eks", "rds", "dynamodb",
-		"azure", "microsoft azure", "aks", "azure functions", "azure storage",
+	// Hard bare-metal gate. There is no cloud account here, so a managed-cloud
+	// issue cannot be reproduced or verified locally no matter how good it
+	// looks - it is disqualified outright rather than merely marked down. A
+	// -0.50 penalty was not enough: k8s#141198
+	// ("[Provider:aws,azure,gce]") still scored 0.28 and got alerted.
+	//
+	// Short tokens are matched on word boundaries on purpose. As plain
+	// substrings "aks" hits breaks/makes/takes, "eks" hits weeks, and "rds"
+	// hits words - which would silently disqualify unrelated issues.
+	// Deliberately NOT excluded: "openstack" and "ironic", which are how
+	// metal3/bare-metal provisioning is described.
+	cloudPhrases := []string{
+		"google cloud", "compute engine", "cloud sql", "bigquery", "pubsub",
+		"amazon web", "s3 bucket", "microsoft azure", "azure functions",
+		"azure storage", "cloud provider", "cloudprovider",
+		"cloudformation", "arm template", "azure blob", "aws sdk", "boto3",
+		"workload identity", "managed identity",
 	}
-	if containsAny(combined, cloudKeywords) {
-		score -= 0.50
+	// Deliberately NOT tokens: "s3" and "gcs". Thanos, Loki and Mimir all run
+	// their object store against MinIO or Ceph on bare metal, so those two
+	// would throw away the whole observability backlog.
+	cloudTokens := []string{
+		"gcp", "gke", "gce", "aws", "ec2", "eks", "rds", "dynamodb",
+		"azure", "aks", "cloudfront", "cloudwatch",
+		"fargate", "route53", "elb", "alb", "nlb", "ebs", "efs", "iam",
+		"azurerm",
+	}
+	if containsAny(combined, cloudPhrases) || containsAnyWord(combined, cloudTokens) {
+		return -1
 	}
 
-	if hasAnyLabel(issue.Labels, "provider:google", "provider:aws", "provider:azure", "area/gcp", "area/aws", "area/azure") {
-		score -= 0.50
+	if hasAnyLabel(issue.Labels, "provider:google", "provider:aws", "provider:azure",
+		"area/gcp", "area/aws", "area/azure", "area/provider/aws", "area/provider/azure",
+		"area/provider/gcp") {
+		return -1
+	}
+
+	// Frontend/JS gate. This is a Go/DevOps track, so a React or CSS task is
+	// not a fit no matter how well scored: one run alerted seven consecutive
+	// grafana react-router issues (#130187-#130194).
+	if hasAnyLabel(issue.Labels, "area/frontend", "area/frontend-platform", "javascript",
+		"typescript", "area/ui", "ui/ux", "area/design-system") {
+		return -1
+	}
+	// Phrases only, no bare "react": a controller issue legitimately says
+	// "the reconciler should react to node changes", and "ui" appears inside
+	// build/guide text. Same trap as "aks" matching "breaks".
+	frontendPhrases := []string{
+		"react-router", "react component", "reactjs", "react hook",
+		"typescript", "javascript", "peer-dependency", "peer dependency",
+		"storybook", "webpack", "eslint", "scss", "tailwind", "frontend",
+		"front-end", "css class", "stylesheet",
+	}
+	if containsAny(combined, frontendPhrases) || containsAnyWord(combined, []string{"npm", "yarn", "jsx", "tsx"}) {
+		return -1
+	}
+
+	// "internal" means the project's own team is doing it; outside PRs are not
+	// wanted. Same for issues explicitly parked or already owned.
+	if hasAnyLabel(issue.Labels, "internal", "wontfix", "invalid", "duplicate",
+		"lifecycle/frozen", "do-not-merge") {
+		return -1
+	}
+
+	// Platform gate. This is a Linux bare-metal box: a darwin or Windows bug
+	// cannot be reproduced or verified here. podman#29396 ("Cannot build image
+	// on macOS through podman machine") was the top alert of a whole batch at
+	// score 1.42 and there is no way to work on it.
+	//
+	// Only disqualify when the issue is *exclusively* about those platforms.
+	// Plenty of good Linux issues mention macOS in passing ("also seen on
+	// macOS"), so a Linux signal anywhere in the text keeps the issue alive.
+	//
+	// Bare "windows" cannot be a plain token either, because monitoring issues
+	// talk about staleness windows and sliding windows. Same trap as "aks" in
+	// "breaks", so it gets its own preceding-word check below.
+	if hasAnyLabel(issue.Labels, "os/macos", "os/windows", "platform/mac",
+		"platform/windows", "area/windows", "kind/windows", "macos", "windows",
+		"os: mac", "os-darwin") {
+		return -1
+	}
+	otherOSPhrases := []string{
+		"macos", "mac os", "osx", "os x", "apple silicon", "macbook",
+		"podman machine", "docker desktop", "homebrew", "xcode",
+		"on windows", "windows server", "windows container", "windows node",
+		"powershell", "wsl2", "wsl 2", "windows 10", "windows 11",
+		"%userprofile%", "%appdata%", "mingw", "msvc", "cmd.exe",
+	}
+	otherOSTokens := []string{"darwin", "win32", "win64"}
+	linuxTokens := []string{
+		"linux", "ubuntu", "debian", "fedora", "rhel", "centos", "alpine",
+		"systemd", "kubernetes", "kubelet", "containerd", "cgroup", "iptables",
+	}
+	if (containsAny(combined, otherOSPhrases) || containsAnyWord(combined, otherOSTokens) ||
+		mentionsWindowsOS(combined)) &&
+		!containsAnyWord(combined, linuxTokens) {
+		return -1
+	}
+
+	// Language gate. An issue written in a script Mehrdad cannot read is not
+	// workable no matter how good it scores: an ollama Gemini Pro bug filed
+	// entirely in Chinese went out as an alert. Adding the AI-Infra projects
+	// made this common, since ollama and llama.cpp draw a large Chinese-speaking
+	// user base.
+	if mostlyNonLatin(combined) {
+		return -1
+	}
+
+	// Bot-filed tracking issues are not contributions. golang/go alone took 11
+	// of 28 alerts in one batch this way: gopherbot opens watchflakes flake
+	// collectors ("Automation"), gopherbot opens backport trackers
+	// ("CherryPickApproved"), and bazel-io forks release issues from the
+	// internal fork ("Forked from #30596"). None of them are claimable by an
+	// outside contributor - the flake collectors carry no reproducible failure
+	// and backports are release-team mechanics.
+	if isTrackingIssue(issue) {
+		return -1
 	}
 
 	// Needs triage penalty - can't work on until triaged
@@ -431,6 +538,283 @@ func convertLabels(labelNames []string) []*github.Label {
 func containsAny(text string, keywords []string) bool {
 	return slices.ContainsFunc(keywords, func(kw string) bool {
 		return strings.Contains(text, kw)
+	})
+}
+
+// archivedCache memoises the archived flag per repo. The answer effectively
+// never changes during a process lifetime, and this runs once per repo per
+// scan, so caching keeps it to a single extra API call per repo.
+var (
+	archivedMu    sync.Mutex
+	archivedCache = map[string]bool{}
+)
+
+// isArchived reports whether owner/repo is archived (read-only). On any API
+// error it returns false: a transient failure must not silently hide a repo.
+func (f *IssueFinder) isArchived(ctx context.Context, owner, name string) bool {
+	key := owner + "/" + name
+
+	archivedMu.Lock()
+	if v, ok := archivedCache[key]; ok {
+		archivedMu.Unlock()
+		return v
+	}
+	archivedMu.Unlock()
+
+	repo, _, err := f.client.Repositories.Get(ctx, owner, name)
+	if err != nil {
+		log.Printf("[Archived] could not check %s: %v (assuming active)", key, err)
+		return false
+	}
+	v := repo.GetArchived() || repo.GetDisabled()
+
+	archivedMu.Lock()
+	archivedCache[key] = v
+	archivedMu.Unlock()
+	return v
+}
+
+// minAlertScore is the floor for sending an alert at all. Overridable with
+// MIN_ALERT_SCORE. Anything the scorer disqualified is negative and is always
+// dropped regardless of this value.
+func minAlertScore() float64 {
+	if raw := strings.TrimSpace(os.Getenv("MIN_ALERT_SCORE")); raw != "" {
+		if v, err := strconv.ParseFloat(raw, 64); err == nil {
+			return v
+		}
+	}
+	return 0.50
+}
+
+// filterAlertable drops disqualified and weak issues before anything is sent.
+// Scoring on its own is not a filter: the scorer can return -1 and the alert
+// still goes out unless someone acts on it, which is what happened with
+// kubernetes#141200 ("[Feature:GPUDevicePlugin]", score -1.00, alerted).
+func filterAlertable(issues []Issue) []Issue {
+	floor := minAlertScore()
+	kept := make([]Issue, 0, len(issues))
+	var disqualified, weak int
+	for _, iss := range issues {
+		switch {
+		case iss.Score < 0:
+			disqualified++
+		case iss.Score < floor:
+			weak++
+		default:
+			kept = append(kept, iss)
+		}
+	}
+	if disqualified > 0 || weak > 0 {
+		GetLogger().Info("Filtered %d disqualified + %d below %.2f; %d alertable",
+			disqualified, weak, floor, len(kept))
+	}
+
+	// Cap the burst. Once the ML/AI repos stopped crowding the top-30 the scan
+	// surfaced a real backlog and fired 49 Telegram messages in one go, which
+	// is unusable. Send the best few and let the rest come round next cycle -
+	// they stay in the DB and are not lost.
+	sort.Slice(kept, func(i, j int) bool { return kept[i].Score > kept[j].Score })
+
+	// Spread the burst across repos before capping it. A single busy repo can
+	// otherwise own the whole budget: golang/go filed 11 of 28 alerts in one
+	// night, so every other project was invisible that day even though the
+	// scan had found them.
+	if perRepo := maxAlertsPerRepo(); perRepo > 0 {
+		seen := map[string]int{}
+		spread := make([]Issue, 0, len(kept))
+		var crowded int
+		for _, iss := range kept {
+			key := iss.Project.Org + "/" + iss.Project.Name
+			if seen[key] >= perRepo {
+				crowded++
+				continue
+			}
+			seen[key]++
+			spread = append(spread, iss)
+		}
+		if crowded > 0 {
+			GetLogger().Info("Held back %d alerts over %d per repo (they stay in the DB for the next cycle)",
+				crowded, perRepo)
+		}
+		kept = spread
+	}
+
+	if max := maxAlertsPerRun(); max > 0 && len(kept) > max {
+		GetLogger().Info("Capping alerts: %d alertable, sending top %d by score", len(kept), max)
+		kept = kept[:max]
+	}
+	return kept
+}
+
+// maxAlertsPerRepo bounds how many alerts one repo may contribute to a single
+// cycle. Override with MAX_ALERTS_PER_REPO; 0 disables the spread.
+func maxAlertsPerRepo() int {
+	if raw := strings.TrimSpace(os.Getenv("MAX_ALERTS_PER_REPO")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+			return v
+		}
+	}
+	return 2
+}
+
+// maxAlertsPerRun bounds how many alerts a single cycle may send.
+// Override with MAX_ALERTS_PER_RUN; 0 disables the cap.
+func maxAlertsPerRun() int {
+	if raw := strings.TrimSpace(os.Getenv("MAX_ALERTS_PER_RUN")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v >= 0 {
+			return v
+		}
+	}
+	return 6
+}
+
+// dropTakenIssues removes issues that already have an open or recently
+// stalled linked PR. Failing open is deliberate: a flaky timeline call should
+// surface a maybe-taken issue rather than silently swallow a good one.
+func (f *IssueFinder) dropTakenIssues(ctx context.Context, issues []Issue) []Issue {
+	kept := make([]Issue, 0, len(issues))
+	for _, iss := range issues {
+		taken, reason := collectLinkedPRs(ctx, iss.Project, iss.Number,
+			func(cb func() (*github.Response, error)) error {
+				return f.rateLimiter.executeWithRetry(ctx,
+					fmt.Sprintf("timeline %s/%s#%d", iss.Project.Org, iss.Project.Name, iss.Number), cb)
+			},
+			f.client,
+			func(n int) *github.PullRequest {
+				pr, _, err := f.client.PullRequests.Get(ctx, iss.Project.Org, iss.Project.Name, n)
+				if err != nil {
+					return nil
+				}
+				return pr
+			},
+		)
+		if taken {
+			GetLogger().Info("Skipping %s/%s#%d - %s",
+				iss.Project.Org, iss.Project.Name, iss.Number, reason)
+			continue
+		}
+		kept = append(kept, iss)
+	}
+	return kept
+}
+
+// botAuthors are accounts that file tracking issues rather than real work
+// requests. GitHub reports gopherbot and bazel-io with type "User", so the
+// account type alone is not enough to recognise them.
+var botAuthors = map[string]bool{
+	"gopherbot": true, "bazel-io": true, "k8s-ci-robot": true,
+	"k8s-triage-robot": true, "openshift-bot": true, "cilium-renovate": true,
+	"prow": true, "tide": true,
+}
+
+// isTrackingIssue reports whether an issue is project bookkeeping rather than
+// something an outside contributor can pick up: flake collectors, backport
+// requests, release forks and embargoed security trackers.
+func isTrackingIssue(issue *github.Issue) bool {
+	login := strings.ToLower(issue.GetUser().GetLogin())
+	if botAuthors[login] || strings.HasSuffix(login, "[bot]") || issue.GetUser().GetType() == "Bot" {
+		return true
+	}
+	if hasAnyLabel(issue.Labels, "automation", "cherrypickapproved",
+		"cherrypickcandidate", "backport", "kind/backport") {
+		return true
+	}
+	body := strings.ToLower(safeString(issue.Body))
+	// Go's security process files a stub for an already-embargoed CVE; the
+	// fix is written inside Google and only lands through the release team.
+	if strings.Contains(body, "this is a private issue for cve") {
+		return true
+	}
+	// bazel-io release forks, in case the account is ever renamed.
+	return strings.HasPrefix(strings.TrimSpace(body), "forked from #")
+}
+
+// wordBoundaryCache keeps one compiled regexp per token so the hot scoring
+// path does not recompile on every issue.
+var (
+	wordBoundaryMu    sync.Mutex
+	wordBoundaryCache = map[string]*regexp.Regexp{}
+)
+
+// nonLatinScripts are the writing systems that put an issue out of reach here.
+// Han also covers the kanji in Japanese text, which is the intent - the gate is
+// about whether the report can be read, not about which language it is.
+var nonLatinScripts = []*unicode.RangeTable{
+	unicode.Han, unicode.Hiragana, unicode.Katakana, unicode.Hangul,
+	unicode.Cyrillic, unicode.Arabic, unicode.Hebrew, unicode.Thai,
+}
+
+// mostlyNonLatin reports whether enough of the text is written in a non-Latin
+// script that the issue cannot be worked on.
+//
+// It is a ratio rather than a plain "contains" check on purpose. Plenty of
+// perfectly good English issues quote a stack trace or a log line with a few
+// CJK characters in it, and those must survive; an issue actually written in
+// Chinese is dominated by them. The floor of 8 characters keeps a stray glyph
+// in an otherwise English title from tripping the gate.
+func mostlyNonLatin(text string) bool {
+	var latin, other int
+	for _, r := range text {
+		switch {
+		case unicode.IsOneOf(nonLatinScripts, r):
+			other++
+		case unicode.IsLetter(r):
+			latin++
+		}
+	}
+	if other < 8 {
+		return false
+	}
+	// CJK is dense: a title carrying real content in it is short in character
+	// count next to the equivalent English, so the bar sits low deliberately.
+	return other*5 >= latin
+}
+
+// windowsWordRe finds the word "windows" together with whatever word precedes
+// it, so the two meanings can be told apart.
+var windowsWordRe = regexp.MustCompile(`(?:(\w+)[\s-]+)?\bwindows\b`)
+
+// windowsTimeSenses are the words that make "windows" a time range rather than
+// the operating system. Monitoring projects are full of them: Prometheus talks
+// about staleness windows, Thanos about compaction windows, KEDA about scaling
+// windows. Matching bare "windows" without this check would quietly disqualify
+// most of the observability backlog.
+var windowsTimeSenses = map[string]bool{
+	"staleness": true, "sliding": true, "rolling": true, "time": true,
+	"lookback": true, "retention": true, "scrape": true, "evaluation": true,
+	"aggregation": true, "sampling": true, "observation": true, "grace": true,
+	"maintenance": true, "compaction": true, "scaling": true, "cooldown": true,
+	"tumbling": true, "overlapping": true, "congestion": true, "receive": true,
+	"tcp": true, "these": true, "those": true, "such": true,
+}
+
+// mentionsWindowsOS reports whether "windows" appears in the operating-system
+// sense anywhere in the text. One OS-sense hit is enough: ollama#17591
+// ("Windows: ollama create fails with 400 Bad Request") was alerted at score
+// 1.03 because the OS name only appeared as a bare title prefix, which none of
+// the phrase patterns covered.
+func mentionsWindowsOS(text string) bool {
+	for _, m := range windowsWordRe.FindAllStringSubmatch(text, -1) {
+		if !windowsTimeSenses[m[1]] {
+			return true
+		}
+	}
+	return false
+}
+
+// containsAnyWord reports whether text contains any keyword as a whole word.
+// Needed for short ambiguous tokens: as a bare substring "aks" matches
+// "breaks", "eks" matches "weeks" and "rds" matches "words".
+func containsAnyWord(text string, keywords []string) bool {
+	return slices.ContainsFunc(keywords, func(kw string) bool {
+		wordBoundaryMu.Lock()
+		re, ok := wordBoundaryCache[kw]
+		if !ok {
+			re = regexp.MustCompile(`\b` + regexp.QuoteMeta(kw) + `\b`)
+			wordBoundaryCache[kw] = re
+		}
+		wordBoundaryMu.Unlock()
+		return re.MatchString(text)
 	})
 }
 
@@ -560,6 +944,9 @@ type IssueFinder struct {
 	fileStore     *FileStorage
 	monitor       *IssueMonitor
 	mu            sync.RWMutex
+	// convention-aware Telegram actions
+	contribPolicies map[string]ContributionConvention
+	contribPolicy   *ContributionPolicy
 }
 
 func NewIssueFinder(config *Config, notifier *LocalNotifier) (*IssueFinder, error) {
@@ -579,17 +966,32 @@ func NewIssueFinder(config *Config, notifier *LocalNotifier) (*IssueFinder, erro
 		}
 	}
 
+	GetLogger().Info("=== main() starting ===")
+	GetLogger().Info("DB connection string: %s", maskDBConn(config.DBConnectionString))
 	db, err := sqlx.Connect("postgres", config.DBConnectionString)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to database: %w", err)
+		GetLogger().Warn("Failed to connect to database, retrying: %v", err)
+		// Retry connection with backoff rather than crashing
+		for retries := 0; retries < 5; retries++ {
+			GetLogger().Warn("DB reconnect attempt %d/5...", retries+1)
+			time.Sleep(time.Duration(retries+1) * time.Second)
+			db, err = sqlx.Connect("postgres", config.DBConnectionString)
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to database after retries: %w", err)
+		}
 	}
+	GetLogger().Info("Database connection established successfully")
 
 	client := github.NewClient(tc)
 	rateLimiter := NewRateLimiter(client, 100)
 
-	log.Printf("Initializing rate limiter with 100 request buffer...")
+	GetLogger().Info("Initializing rate limiter with 100 request buffer...")
 	if err := rateLimiter.checkRateLimit(ctx); err != nil {
-		log.Printf("Warning: failed to fetch initial rate limits: %v", err)
+		GetLogger().Warn("Failed to fetch initial rate limits: %v", err)
 	}
 
 	finder := &IssueFinder{
@@ -618,7 +1020,11 @@ func NewIssueFinder(config *Config, notifier *LocalNotifier) (*IssueFinder, erro
 		finder.tracker = tracker
 	}
 
-	antiSpamManager, err := NewNotificationSpamManager(*config.AntiSpam, db.DB)
+	antiSpamConfig := config.AntiSpam
+	if antiSpamConfig == nil {
+		antiSpamConfig = &NotificationSpamConfig{}
+	}
+	antiSpamManager, err := NewNotificationSpamManager(*antiSpamConfig, db.DB)
 	if err != nil {
 		log.Printf("Warning: failed to create anti-spam manager: %v", err)
 	} else {
@@ -668,6 +1074,22 @@ func NewIssueFinder(config *Config, notifier *LocalNotifier) (*IssueFinder, erro
 	}
 
 	finder.initializeProjects()
+
+	// Convention-aware Telegram actions: load per-repo contribution policy and
+	// the trust-based ContributionPolicy engine, then start the button poller.
+	finder.contribPolicies = LoadConventions()
+	if config.GitHubToken != "" {
+		// Resolve the authenticated user's login for the ContributionPolicy engine.
+		ghUser, _, uErr := client.Users.Get(ctx, "")
+		ghLogin := ""
+		if uErr == nil && ghUser != nil {
+			ghLogin = ghUser.GetLogin()
+		}
+		if cp := NewContributionPolicy(client, db, ghLogin); cp != nil {
+			finder.contribPolicy = cp
+		}
+	}
+	go finder.StartCallbackPoller()
 
 	return finder, nil
 }
@@ -959,6 +1381,21 @@ func (f *IssueFinder) initializeProjects() {
 		{Org: "ninja-build", Name: "ninja", Category: "CI/CD", Stars: 3000},
 		{Org: "rust-lang", Name: "cargo", Category: "CI/CD", Stars: 5000},
 
+		// AI infrastructure written in Go. Deliberately a separate category
+		// from ML/AI: the ML/AI entries below are Python research frameworks
+		// that this track excludes, while these are gateways, routers and
+		// Kubernetes inference operators - the same controller, proxy and
+		// scheduling work as the rest of the list, only serving models.
+		// They run and test on bare metal.
+		{Org: "envoyproxy", Name: "ai-gateway", Category: "AI-Infra", Stars: 1900},
+		{Org: "kserve", Name: "kserve", Category: "AI-Infra", Stars: 5700},
+		{Org: "vllm-project", Name: "aibrix", Category: "AI-Infra", Stars: 4900},
+		{Org: "kagent-dev", Name: "kagent", Category: "AI-Infra", Stars: 3400},
+		{Org: "kubeai-project", Name: "kubeai", Category: "AI-Infra", Stars: 1200},
+		{Org: "llm-d", Name: "llm-d-router", Category: "AI-Infra", Stars: 280},
+		{Org: "maximhq", Name: "bifrost", Category: "AI-Infra", Stars: 7000},
+		{Org: "ollama", Name: "ollama", Category: "AI-Infra", Stars: 177000},
+
 		// ML/AI Projects
 		{Org: "tensorflow", Name: "tensorflow", Category: "ML/AI", Stars: 185000},
 		{Org: "pytorch", Name: "pytorch", Category: "ML/AI", Stars: 85000},
@@ -1140,9 +1577,49 @@ func (f *IssueFinder) initializeProjects() {
 		{Org: "kopia", Name: "kopia", Category: "Backup", Stars: 8000},
 	}
 
+	f.projects = excludeCategories(f.projects)
+
 	sort.Slice(f.projects, func(i, j int) bool {
 		return f.projects[i].Stars > f.projects[j].Stars
 	})
+}
+
+// excludedCategories are scanned by nobody on a Go/DevOps track. They were the
+// real source of the noise: only the top 30 projects by stars get checked each
+// run, and the ML/AI entries (transformers 140k stars, langchain 100k,
+// pytorch 85k) outrank every CNCF project, so they crowded the scan out and
+// produced Python alerts no scoring tweak could fix.
+// Override with SCAN_CATEGORIES_EXCLUDE (comma separated, empty to disable).
+func excludedCategories() map[string]bool {
+	raw, ok := os.LookupEnv("SCAN_CATEGORIES_EXCLUDE")
+	if !ok {
+		raw = "ML/AI"
+	}
+	out := map[string]bool{}
+	for _, c := range strings.Split(raw, ",") {
+		if c = strings.TrimSpace(strings.ToLower(c)); c != "" {
+			out[c] = true
+		}
+	}
+	return out
+}
+
+func excludeCategories(in []Project) []Project {
+	drop := excludedCategories()
+	if len(drop) == 0 {
+		return in
+	}
+	kept := make([]Project, 0, len(in))
+	for _, p := range in {
+		if drop[strings.ToLower(p.Category)] {
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if n := len(in) - len(kept); n > 0 {
+		log.Printf("[Scan] excluded %d projects by category (%d remain)", n, len(kept))
+	}
+	return kept
 }
 
 func (f *IssueFinder) FindIssues(ctx context.Context) ([]Issue, error) {
@@ -1184,6 +1661,17 @@ func (f *IssueFinder) FindIssues(ctx context.Context) ([]Issue, error) {
 			projectWg.Add(1)
 			go func(p Project) {
 				defer projectWg.Done()
+
+				// An archived repo is read-only: it cannot accept a pull
+				// request at all, so any issue in it is unworkable no matter
+				// how good it looks. Learned the hard way on
+				// containrrr/watchtower#2121 - the bug was real and the fix
+				// was written and tested before the PR came back
+				// "Repository was archived so is read-only".
+				if f.isArchived(ctx, p.Org, p.Name) {
+					log.Printf("Skipping %s/%s: repository is archived (read-only)", p.Org, p.Name)
+					return
+				}
 
 				log.Printf("Checking issues for %s/%s (%d stars)", p.Org, p.Name, p.Stars)
 
@@ -2298,6 +2786,69 @@ func PrintConfirmedGoodFirstIssues(issues []ConfirmedGoodFirstIssue) {
 	}
 }
 
+// recordAlerted persists the fact that these issues were alerted on, into both
+// the anti-spam log and the issue tracker.
+//
+// This used to live only in ProcessNewIssueNotifications, which runs under the
+// manual `mode == "confirmed"` path and not in the scheduled loop that actually
+// sends the Telegram alerts. The result was that after 339 issues seen,
+// notification_log and tracked_issues were both still empty: WasAlreadyNotified
+// could never return true, so the cooldown and the per-project notification
+// limits in NotificationSpamManager were dead code in the deployed daemon.
+// De-duplication only appeared to work because seen_issues is written earlier by
+// a different mechanism.
+//
+// Failures are logged and skipped rather than aborting the loop - the alert has
+// already gone out at this point, so the worst case is bookkeeping that lags,
+// not a missed notification.
+func (f *IssueFinder) recordAlerted(issues []Issue) {
+	for _, issue := range issues {
+		if f.antiSpam != nil {
+			if err := f.antiSpam.RecordNotification(issue.Project.Name, issue.URL, issue.Number); err != nil {
+				GetLogger().Warn("Failed to record notification for %s: %v", issue.URL, err)
+			}
+		}
+
+		if f.tracker == nil {
+			continue
+		}
+
+		// Issue carries plain string labels rather than the richer flags on
+		// ConfirmedGoodFirstIssue, so the tracker fields are derived from what is
+		// actually known at this point. HasAssignee and HasPR stay false on
+		// purpose: dropTakenIssues ran immediately above and removed anything
+		// with an open linked PR, so everything still here is unclaimed as far
+		// as this pass could determine.
+		hasConfirmed := false
+		for _, l := range issue.Labels {
+			switch strings.ToLower(strings.TrimSpace(l)) {
+			case "triage/accepted", "confirmed", "status/confirmed", "kind/confirmed":
+				hasConfirmed = true
+			}
+		}
+
+		tracked := &TrackedIssue{
+			IssueURL:     issue.URL,
+			IssueTitle:   issue.Title,
+			ProjectOrg:   issue.Project.Org,
+			ProjectName:  issue.Project.Name,
+			IssueNumber:  issue.Number,
+			Status:       StatusNew,
+			Score:        issue.Score,
+			Labels:       strings.Join(issue.Labels, ","),
+			HasGoodFirst: issue.IsGoodFirst,
+			HasConfirmed: hasConfirmed,
+		}
+		if err := f.tracker.AddIssue(tracked); err != nil {
+			GetLogger().Warn("Failed to track %s: %v", issue.URL, err)
+			continue
+		}
+		if err := f.tracker.MarkNotified(issue.URL); err != nil {
+			GetLogger().Warn("Failed to mark %s as notified: %v", issue.URL, err)
+		}
+	}
+}
+
 func (f *IssueFinder) ProcessNewIssueNotifications(ctx context.Context, issues []ConfirmedGoodFirstIssue) ([]Issue, error) {
 	var newIssues []Issue
 
@@ -2363,67 +2914,17 @@ func (f *IssueFinder) ProcessNewIssueNotifications(ctx context.Context, issues [
 	return newIssues, nil
 }
 
-func (f *IssueFinder) SendTelegramAlert(issues []Issue) error {
-	if f.bot == nil {
-		return nil
+// SendTelegramAlert returns the issues that Telegram actually accepted, so the
+// caller only records those as notified. With no bot configured every issue
+// counts as delivered: the local/email path still runs and the bookkeeping
+// should not depend on Telegram being set up.
+func (f *IssueFinder) SendTelegramAlert(issues []Issue) ([]Issue, error) {
+	if f.bot == nil || len(issues) == 0 {
+		return issues, nil
 	}
-	if len(issues) == 0 {
-		return nil
-	}
-
-	var messages []string
-
-	header := fmt.Sprintf("🚀 *New Learning Opportunities in Go DevOps Projects*\n\n")
-	messages = append(messages, header)
-
-	for i, issue := range issues {
-		if i >= 20 {
-			break
-		}
-
-		scoreEmoji := ""
-		if issue.Score >= 0.8 {
-			scoreEmoji = "🔥"
-		} else if issue.Score >= 0.6 {
-			scoreEmoji = "⭐"
-		} else {
-			scoreEmoji = "✨"
-		}
-
-		labelsText := ""
-		if len(issue.Labels) > 0 {
-			labelsText = fmt.Sprintf("\nLabels: %s", strings.Join(issue.Labels, ", "))
-		}
-
-		msg := fmt.Sprintf(
-			"%s *%s* (%.2f)\n%s\n%s/%s (%d★)%s\n\n",
-			scoreEmoji,
-			truncateString(issue.Title, 80),
-			issue.Score,
-			issue.URL,
-			issue.Project.Org,
-			issue.Project.Name,
-			issue.Project.Stars,
-			labelsText,
-		)
-
-		messages = append(messages, msg)
-	}
-
-	for _, msg := range messages {
-		tgMsg := tgbotapi.NewMessage(f.config.TelegramChatID, msg)
-		tgMsg.ParseMode = "Markdown"
-
-		_, err := f.bot.Send(tgMsg)
-		if err != nil {
-			log.Printf("Error sending Telegram message: %v", err)
-			return err
-		}
-
-		time.Sleep(1 * time.Second)
-	}
-
-	return nil
+	// Send each issue as its own message with convention-aware inline buttons
+	// (Assign / Ask / PR) chosen per repo + your trust level there.
+	return f.SendIssueAlertsWithButtons(issues)
 }
 
 func (f *IssueFinder) SendLocalAlert(issues []Issue) error {
@@ -2880,6 +3381,7 @@ func runMonitorStatusOnly() error {
 }
 
 func main() {
+	log.Printf("=== main() starting ===")
 	cmd, args := ParseCLIArgs()
 
 	if cmd == CmdMCP {
@@ -3021,8 +3523,21 @@ func main() {
 		parsed, err := strconv.ParseInt(chatEnv, 10, 64)
 		if err != nil {
 			log.Printf("Invalid TELEGRAM_CHAT_ID value %q: %v", chatEnv, err)
+		} else {
+			chatID = parsed
 		}
-		chatID = parsed
+	}
+	if chatEnv := os.Getenv("TELEGRAM_CHAT_IDS"); chatEnv != "" {
+		parts := strings.Split(chatEnv, ",")
+		if len(parts) > 0 {
+			parsed, err := strconv.ParseInt(strings.TrimSpace(parts[0]), 10, 64)
+			if err == nil {
+				chatID = parsed
+			}
+			if len(parts) > 1 {
+				log.Printf("Multiple Telegram chats configured: %d chats; routing to primary %d", len(parts), chatID)
+			}
+		}
 	}
 
 	checkInterval := 3600
@@ -3047,6 +3562,9 @@ func main() {
 
 	dbConn := os.Getenv("DB_CONNECTION_STRING")
 	if dbConn == "" {
+		dbConn = os.Getenv("DATABASE_URL")
+	}
+	if dbConn == "" {
 		dbConn = "host=localhost user=postgres password=postgres dbname=issue_finder sslmode=disable port=5432"
 	}
 
@@ -3061,6 +3579,7 @@ func main() {
 		GitHubToken:        os.Getenv("GITHUB_TOKEN"),
 		TelegramBotToken:   os.Getenv("TELEGRAM_BOT_TOKEN"),
 		TelegramChatID:     chatID,
+		TelegramChatIDs:    parseTelegramChatIDs(os.Getenv("TELEGRAM_CHAT_ID"), os.Getenv("TELEGRAM_CHAT_IDS")),
 		CheckInterval:      checkInterval,
 		MaxIssuesPerRepo:   maxIssues,
 		DBConnectionString: dbConn,
@@ -3099,44 +3618,67 @@ func main() {
 		cancel()
 	}()
 
-	log.Printf("Starting GitHub Issue Finder...")
-	log.Printf("Checking %d projects for good learning issues", min(len(finder.projects), 30))
+	GetLogger().Info("Starting GitHub Issue Finder...")
+	GetLogger().Info("Checking %d projects for good learning issues", min(len(finder.projects), 30))
+	GetLogger().Info("Main initialization complete, entering main loop")
 
 	runCheck := func() {
-		log.Printf("Running issue check...")
+		GetLogger().Info("Running issue check...")
 		if err := finder.rateLimiter.checkRateLimit(ctx); err != nil {
-			log.Printf("Warning: failed to check rate limit: %v", err)
+			GetLogger().Warn("Warning: failed to check rate limit: %v", err)
 		}
 		issues, err := finder.FindIssues(ctx)
 		if err != nil {
-			log.Printf("Error finding issues: %v", err)
+			GetLogger().Warn("Error finding issues: %v", err)
 			return
 		}
 
-		log.Printf("Found %d new issues", len(issues))
+		GetLogger().Info("Found %d new issues", len(issues))
+
+		// The scorer marks disqualified issues with a negative score (cloud-only,
+		// frontend-only, and so on). Without this filter they were still alerted:
+		// kubernetes#141200 went out at score -1.00 because nothing acted on it.
+		issues = filterAlertable(issues)
+
+		// Last gate before anything is sent: drop issues someone is already
+		// fixing. Every genuinely good issue in one 28-alert batch turned out
+		// to be taken - dapr#10310 had PR #10311 opened the same day, k9s#4145
+		// had two PRs, traefik#13643 had #13644 - and the alert still said
+		// "Strong claim, open a PR". The check existed but only ran inside the
+		// qualified finder, which is not the path that sends Telegram alerts.
+		//
+		// Deliberately after filterAlertable: this is one timeline call per
+		// issue, so it only runs on the handful that survived the cap.
+		issues = finder.dropTakenIssues(ctx, issues)
 
 		if len(issues) == 0 {
-			log.Printf("No new issues found")
+			GetLogger().Info("No new issues found")
 			return
 		}
 
-		log.Printf("Sending alerts for %d issues...", len(issues))
+		GetLogger().Info("Sending alerts for %d issues...", len(issues))
 
-		if err := finder.SendTelegramAlert(issues); err != nil {
-			log.Printf("Error sending Telegram alert: %v", err)
+		delivered, err := finder.SendTelegramAlert(issues)
+		if err != nil {
+			GetLogger().Warn("Error sending Telegram alert: %v", err)
 		} else if finder.bot != nil {
-			log.Printf("Successfully sent Telegram alert for %d issues", len(issues))
+			GetLogger().Info("Successfully sent Telegram alert for %d issues", len(delivered))
 		}
 
-		log.Printf("Sending local/email alerts...")
+		// Record only what Telegram actually accepted. Anything it rejected stays
+		// unrecorded on purpose, so the next cycle retries it rather than
+		// suppressing it as already notified.
+		finder.recordAlerted(delivered)
+
+		GetLogger().Info("Sending local/email alerts...")
 		if err := finder.SendLocalAlert(issues); err != nil {
-			log.Printf("Error processing local/email alert: %v", err)
+			GetLogger().Warn("Error processing local/email alert: %v", err)
 		} else if config.Email != nil {
-			log.Printf("Email/local alert delivered for %d issues", len(issues))
+			GetLogger().Info("Email/local alert delivered for %d issues", len(issues))
 		} else {
-			log.Printf("Logged %d issues locally (email disabled)", len(issues))
+			GetLogger().Info("Logged %d issues locally (email disabled)", len(issues))
 		}
-		log.Printf("Alert processing complete")
+		GetLogger().Info("Alert processing complete")
 	}
 
 	runGoodFirstIssues := func() {
@@ -3302,7 +3844,7 @@ func main() {
 				log.Printf("Error sending local alert: %v", err)
 			}
 			if finder.bot != nil {
-				if err := finder.SendTelegramAlert(newIssues); err != nil {
+				if _, err := finder.SendTelegramAlert(newIssues); err != nil {
 					log.Printf("Error sending Telegram alert: %v", err)
 				}
 			}

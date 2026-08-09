@@ -13,7 +13,7 @@ monitor:
   notifications:
     local: true
     email: true
-    telegram: false
+    telegram: true
     
   filters:
     min_score: 0.75

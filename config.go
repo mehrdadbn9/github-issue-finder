@@ -12,6 +12,7 @@ type Config struct {
 	GitHubToken        string
 	TelegramBotToken   string
 	TelegramChatID     int64
+	TelegramChatIDs    []int64  // multi-target: group + private chat
 	CheckInterval      int
 	MaxIssuesPerRepo   int
 	MaxProjects        int
@@ -152,14 +153,30 @@ func LoadConfig() (*Config, error) {
 		DBConnectionString: os.Getenv("DB_CONNECTION_STRING"),
 	}
 
-	if chatEnv := os.Getenv("TELEGRAM_CHAT_ID"); chatEnv != "" {
-		parsed, err := strconv.ParseInt(chatEnv, 10, 64)
-		if err != nil {
-			return nil, ConfigValidationError{Field: "TELEGRAM_CHAT_ID", Message: fmt.Sprintf("invalid value %q: %v", chatEnv, err)}
+	// Support both TELEGRAM_CHAT_ID (singular, single int) and
+	// TELEGRAM_CHAT_IDS (plural, comma-separated) for multi-target delivery.
+	chatEnv := os.Getenv("TELEGRAM_CHAT_ID")
+	if chatEnv == "" {
+		chatEnv = os.Getenv("TELEGRAM_CHAT_IDS")
+	}
+	if chatEnv != "" {
+		// Take the first valid ID as primary; others are handled in notify path
+		for _, part := range strings.Split(chatEnv, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			parsed, err := strconv.ParseInt(part, 10, 64)
+			if err == nil {
+				config.TelegramChatID = parsed
+				break
+			}
 		}
-		config.TelegramChatID = parsed
+		if config.TelegramChatID == 0 {
+			return nil, ConfigValidationError{Field: "TELEGRAM_CHAT_ID(S)", Message: fmt.Sprintf("no valid chat id parsed from %q", chatEnv)}
+		}
 	} else {
-		config.TelegramChatID = 683539779
+		config.TelegramChatID = 103767804
 	}
 
 	if intervalEnv := os.Getenv("CHECK_INTERVAL"); intervalEnv != "" {
