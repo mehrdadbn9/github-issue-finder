@@ -99,7 +99,7 @@ func LoadConventions() map[string]ContributionConvention {
 				m[k] = v
 			}
 		} else {
-			log.Printf("[Policy] invalid CONTRIB_POLICY JSON: %v", err)
+			GetLogger().Warn("[Policy] invalid CONTRIB_POLICY JSON: %v", err)
 		}
 	}
 	return m
@@ -229,7 +229,7 @@ func sendIssueWithButtons(f *IssueFinder, issue Issue) error {
 		tgMsg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 
 		if _, err := f.bot.Send(tgMsg); err != nil {
-			log.Printf("Telegram send error to chat %d: %v", chatID, err)
+			GetLogger().Error("Telegram send error to chat %d: %v", chatID, err)
 			lastErr = err
 		}
 	}
@@ -412,10 +412,10 @@ func (f *IssueFinder) SendIssueAlertsWithButtons(issues []Issue) ([]Issue, error
 // (no inbound port required).
 func (f *IssueFinder) StartCallbackPoller() {
 	if f.bot == nil {
-		log.Printf("[Telegram] callback poller not started (no bot)")
+		GetLogger().Warn("[Telegram] callback poller not started (no bot)")
 		return
 	}
-	log.Printf("[Telegram] starting callback poller for Assign/Ask/PR actions")
+	GetLogger().Info("[Telegram] starting callback poller for Assign/Ask/PR actions")
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	ch := f.bot.GetUpdatesChan(u)
@@ -428,6 +428,15 @@ func (f *IssueFinder) StartCallbackPoller() {
 }
 
 func (f *IssueFinder) handleCallback(cq *tgbotapi.CallbackQuery) {
+	GetLogger().Info("[Telegram] callback received: data=%q from=%s", cq.Data, func() string {
+		if cq.From != nil {
+			if cq.From.UserName != "" {
+				return "@" + cq.From.UserName
+			}
+			return fmt.Sprintf("id=%d", cq.From.ID)
+		}
+		return "unknown"
+	}())
 	data := cq.Data
 	parts := strings.SplitN(data, ":", 2)
 	if len(parts) != 2 {
@@ -549,7 +558,7 @@ func (f *IssueFinder) handleCallback(cq *tgbotapi.CallbackQuery) {
 func (f *IssueFinder) answerCallback(cq *tgbotapi.CallbackQuery, text string) {
 	ans := tgbotapi.NewCallback(cq.ID, text)
 	if _, err := f.bot.Request(ans); err != nil {
-		log.Printf("[Telegram] failed to answer callback: %v", err)
+		GetLogger().Error("[Telegram] failed to answer callback: %v", err)
 	}
 }
 
