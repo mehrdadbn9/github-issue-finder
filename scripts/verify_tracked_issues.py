@@ -33,6 +33,29 @@ def gh(path, params=None):
     except urllib.error.HTTPError as e:
         return {"_error": e.code, "_msg": e.read().decode()[:200]}
 
+def wait_for_search_quota():
+    """Wait for GitHub's search quota to reset when it is nearly exhausted."""
+    rate = gh("/rate_limit")
+    search = rate.get("resources", {}).get("search", {})
+    if search.get("remaining", 3) <= 2:
+        reset = search.get("reset", time.time())
+        wait = reset + 2 - time.time()
+        while wait > 0:
+            time.sleep(min(wait, 60))
+            wait = reset + 2 - time.time()
+
+def search_issues(params):
+    """Search issues with rate-limit handling and one retry for HTTP 403."""
+    for attempt in range(2):
+        wait_for_search_quota()
+        result = gh("/search/issues", params)
+        if not (isinstance(result, dict) and result.get("_error") == 403):
+            return result
+        if attempt == 0:
+            time.sleep(30)
+    print("WARNING: GitHub search API returned HTTP 403 twice; returning empty result")
+    return {"total_count": 0, "items": []}
+
 def psql(q):
     out = subprocess.run(
         ["docker", "exec", "issue-finder-postgres-1", "psql", "-U", "issue-finder",
@@ -40,12 +63,22 @@ def psql(q):
         capture_output=True, text=True)
     return [l for l in out.stdout.strip().splitlines() if l]
 
+open_prs_by_repo = {}
+
 def track_repo(org, name, num):
     """Count open linked PRs referencing this issue."""
-    r = gh(f"/search/issues", {"q": f"repo:{org}/{name} #{num} type:pr state:open"})
-    if isinstance(r, dict) and "_error" in r:
+    repo = (org, name)
+    if repo not in open_prs_by_repo:
+        r = search_issues({"q": f"repo:{org}/{name} is:pr state:open", "per_page": 100})
+        if isinstance(r, dict) and "_error" in r:
+            open_prs_by_repo[repo] = None
+            return None
+        open_prs_by_repo[repo] = r.get("items", [])
+    if open_prs_by_repo[repo] is None:
         return None
-    return r.get("total_count", 0)
+    issue_ref = "#" + str(num)
+    return sum(issue_ref in ((pr.get("title") or "") + "\n" + (pr.get("body") or ""))
+               for pr in open_prs_by_repo[repo])
 
 print("=== 1. TRACKED ISSUES UPSTREAM VERIFICATION ===")
 rows = psql("SELECT id, project_org, project_name, issue_number, issue_title, score, status, has_pr, has_assignee FROM tracked_issues ORDER BY score DESC")
@@ -94,8 +127,8 @@ for row in psql("SELECT project_org, project_name, issue_number FROM tracked_iss
     tracked.add(f"{o}/{n}#{num}")
 new_found = []
 for org, name in repos:
-    r = gh("/search/issues", {"q": f"repo:{org}/{name} is:issue is:open no:assignee created:>{since}",
-                               "sort": "created", "order": "desc", "per_page": 10})
+    r = search_issues({"q": f"repo:{org}/{name} is:issue is:open no:assignee created:>{since}",
+                       "sort": "created", "order": "desc", "per_page": 10})
     if isinstance(r, dict) and "_error" in r:
         print(f"{org}/{name}: search error {r['_error']}")
         continue
